@@ -8308,9 +8308,20 @@ function processLLMRound(state, llmOutputText, build, mcp, schedule, iteration) 
   );
   const finishMeta = directives.length > 0 ? { directives, ...xhsSession ? { xhsSession } : {} } : void 0;
   const segments = sanitizeIntoSegments(cleanedText);
-  if (segments.length === 0) {
-    return { decision: "skip-push", reason: finishMeta ? "side-effects-only" : "empty-generation" };
-  }
+   console.log("[amsg:debug-content]", {
+     cleanedTextLen: cleanedText.length,
+     cleanedTextPreview: cleanedText.slice(0, 200),
+     segmentsCount: segments.length,
+     segments: segments.map((s) => ({
+       rawLen: s.raw?.length ?? -1,
+       rawPreview: (s.raw ?? "").slice(0, 100),
+       sanitizedLen: s.sanitized?.length ?? -1,
+       sanitizedPreview: (s.sanitized ?? "").slice(0, 100),
+     })),
+   });
+   if (segments.length === 0) {
+     return { decision: "skip-push", reason: finishMeta ? "side-effects-only" : "empty-generation" };
+   }
   const lastIdx = segments.length - 1;
   return {
     decision: "finish",
