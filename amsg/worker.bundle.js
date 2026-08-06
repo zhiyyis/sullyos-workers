@@ -1956,6 +1956,9 @@ async function sendHookPushPayloads({
       userKey
     });
     const messageIdBase = task.id != null ? `msg_task_${task.id}${occurrenceSuffix(task)}` : `msg_${randomUUID()}`;
+    // 方案4：推送前先存 D1（与 processSingleMessage 路径一致，消息永不丢）
+    const sentAtHook = Date.now();
+    const charIdHook = typeof decryptedPayload.metadata?.charId === "string" ? decryptedPayload.metadata.charId : "";
     for (let i = 0; i < total; i++) {
       const push = { ...pushPayloads[i] };
       if (typeof push.messageId !== "string" || !push.messageId) push.messageId = `${messageIdBase}_hook_${i}`;
@@ -1964,6 +1967,31 @@ async function sendHookPushPayloads({
       push.messageIndex = i + 1;
       push.totalMessages = total;
       stampTaskIdentity(push, task, decryptedPayload, occurrenceMs);
+      // 方案4：加密存 D1
+      try {
+        const encryptedBodyHook = await encryptForStorage(String(push.message || push.body || ""), userKey);
+        await ctx.db.prepare(
+          "INSERT OR REPLACE INTO amsg_inbox (messageId, userKey, charId, sessionId, messageIndex, body, charName, contactName, sentAt, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).bind(
+          push.messageId, userKey, charIdHook, sessionId,
+          push.messageIndex, encryptedBodyHook,
+          decryptedPayload.metadata?.charName || "",
+          decryptedPayload.contactName || "",
+          sentAtHook,
+          JSON.stringify({
+            messageType: decryptedPayload.messageType,
+            source: push.source || "hook",
+            messageSubtype: push.messageSubtype,
+            avatarUrl: push.avatarUrl,
+            taskId: task.id ?? null,
+            taskUuid: decryptedPayload.taskUuid ?? null,
+            recurrenceType: decryptedPayload.recurrenceType ?? null,
+            occurrenceMs: occurrenceMs ?? null
+          })
+        ).run();
+      } catch (dbErr) {
+        console.error("[amsg:inbox] hook 路径 D1 存储失败，继续推送", { messageId: push.messageId, error: dbErr?.message || String(dbErr) });
+      }
       try {
         await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(push));
         sentCount++;
