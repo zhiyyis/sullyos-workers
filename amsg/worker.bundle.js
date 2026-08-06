@@ -3232,6 +3232,13 @@ var D1Adapter = class {
   constructor(db) {
     this._db = db;
   }
+  /**
+   * 透传原生 D1 的 prepare（方案4 amsg_inbox 表用，不经过 adapter 封装层）。
+   * 已存在的任务表/客户端状态表仍走 adapter 方法，新增的 amsg_inbox 直接用原生 D1。
+   */
+  prepare(sql) {
+    return this._db.prepare(sql);
+  }
   /** @private */
   _now() {
     return (/* @__PURE__ */ new Date()).toISOString();
