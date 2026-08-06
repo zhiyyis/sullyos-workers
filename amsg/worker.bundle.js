@@ -469,6 +469,9 @@ function buildContentPush(args) {
   if (args.taskId !== void 0) push.taskId = args.taskId;
   if (args.metadata !== void 0) push.metadata = args.metadata;
   if (args.notification !== void 0) push.notification = args.notification;
+  // 方案3：全家福。每段推送都带上同 session 所有段的 messageId+messageIndex+message，
+  // 这样 APK 被杀状态下用户点任意 1 条通知，客户端能从这 1 条 data 里恢复整个 session 落库。
+  if (args.peers !== void 0) push.peers = args.peers;
   return push;
 }
 function buildReasoningPush(args) {
@@ -2067,6 +2070,12 @@ async function processSingleMessage(task, ctx, providedMasterKey) {
       await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(reasoningPush));
       await new Promise((resolve) => setTimeout(resolve, SLEEP_BETWEEN_MESSAGES_MS2));
     }
+    // 方案3：构建全家福 peers 数组。每段推送都带这个 peers，APK 点任意 1 条即可恢复全部。
+    const peers = messages.map((msg, i) => ({
+      messageIndex: i + 1,
+      messageId: `${messageIdBase}_${i}`,
+      message: msg
+    }));
     for (let i = 0; i < messages.length; i++) {
       const contentPush = buildContentPush({
         messageType: decryptedPayload.messageType,
@@ -2081,7 +2090,8 @@ async function processSingleMessage(task, ctx, providedMasterKey) {
         messageSubtype,
         messageIndex: i + 1,
         totalMessages: messages.length,
-        metadata
+        metadata,
+        peers
       });
       stampTaskIdentity(contentPush, task, decryptedPayload, occurrenceMs);
       await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(contentPush));
