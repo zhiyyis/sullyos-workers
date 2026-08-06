@@ -8439,6 +8439,10 @@ var buildFcmMessage = (token, rawPayload) => {
   const result = {
     message: {
       token,
+      notification: {
+        title,
+        body
+      },
       data: {
         amsgPayload: JSON.stringify(portable),
         amsgHasBody: actualBody ? "1" : "0",
