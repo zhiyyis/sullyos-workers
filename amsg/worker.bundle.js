@@ -2076,6 +2076,46 @@ async function processSingleMessage(task, ctx, providedMasterKey) {
       messageId: `${messageIdBase}_${i}`,
       message: msg
     }));
+    // 方案4：推送前先把每段消息加密存入 D1 (amsg_inbox)，app 启动时主动拉取。
+    // 即使 FCM 推送丢失 / app 被杀通知被清，消息也不会丢，时间戳准确。
+    const sentAt = Date.now();
+    const charId = typeof decryptedPayload.metadata?.charId === "string" ? decryptedPayload.metadata.charId : "";
+    for (let i = 0; i < messages.length; i++) {
+      try {
+        const inboxRow = {
+          messageId: `${messageIdBase}_${i}`,
+          userKey,
+          charId,
+          sessionId,
+          messageIndex: i + 1,
+          body: messages[i],
+          charName: decryptedPayload.metadata?.charName || "",
+          contactName: decryptedPayload.contactName || "",
+          sentAt,
+          metadata: JSON.stringify({
+            messageType: decryptedPayload.messageType,
+            source,
+            messageSubtype,
+            avatarUrl,
+            taskId: task.id ?? null,
+            taskUuid: decryptedPayload.taskUuid ?? null,
+            recurrenceType: decryptedPayload.recurrenceType ?? null,
+            occurrenceMs: occurrenceMs ?? null,
+            peers: peers.length > 1 ? peers : undefined
+          })
+        };
+        const encryptedBody = await encryptForStorage(inboxRow.body, userKey);
+        await ctx.db.prepare(
+          "INSERT OR REPLACE INTO amsg_inbox (messageId, userKey, charId, sessionId, messageIndex, body, charName, contactName, sentAt, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).bind(
+          inboxRow.messageId, inboxRow.userKey, inboxRow.charId, inboxRow.sessionId,
+          inboxRow.messageIndex, encryptedBody, inboxRow.charName, inboxRow.contactName,
+          inboxRow.sentAt, inboxRow.metadata
+        ).run();
+      } catch (dbErr) {
+        console.error("[amsg:inbox] D1 存储失败，继续推送不阻断", { error: dbErr?.message || String(dbErr) });
+      }
+    }
     for (let i = 0; i < messages.length; i++) {
       const contentPush = buildContentPush({
         messageType: decryptedPayload.messageType,
@@ -3998,6 +4038,75 @@ function createSingleUserCloudflareWorker(buildConfig) {
     if (!cfg.db) cfg.db = createD1Adapter(env.DB);
     return cfg;
   }
+  // 方案4：GET /inbox - 拉取未读消息（含懒清理：顺手删 48h 前的旧消息）
+  async function handleInboxGet(url, headers, cfg) {
+    const userId = headers["x-user-id"];
+    if (!userId || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(userId)) {
+      return { status: 400, body: { success: false, error: { code: "INVALID_USER_ID", message: "X-User-Id 缺失或格式错误" } } };
+    }
+    const userKey = await deriveUserEncryptionKey(userId, cfg.masterKey);
+    const now = Date.now();
+    const cutoff = now - 48 * 60 * 60 * 1000;
+    // 懒清理：删 48h 前的旧消息
+    try {
+      await cfg.db.prepare("DELETE FROM amsg_inbox WHERE userKey = ? AND sentAt < ?").bind(userKey, cutoff).run();
+    } catch (e) {
+      console.error("[amsg:inbox] 懒清理失败，继续返回消息", { error: e?.message || String(e) });
+    }
+    // 拉取剩余未读消息
+    try {
+      const { results } = await cfg.db.prepare(
+        "SELECT messageId, charId, sessionId, messageIndex, body, charName, contactName, sentAt, metadata FROM amsg_inbox WHERE userKey = ? ORDER BY sentAt ASC, messageIndex ASC"
+      ).bind(userKey).all();
+      const messages = [];
+      for (const row of results || []) {
+        try {
+          const decryptedBody = await decryptFromStorage(row.body, userKey);
+          messages.push({
+            messageId: row.messageId,
+            charId: row.charId,
+            sessionId: row.sessionId,
+            messageIndex: row.messageIndex,
+            body: decryptedBody,
+            charName: row.charName,
+            contactName: row.contactName,
+            sentAt: row.sentAt,
+            metadata: row.metadata ? JSON.parse(row.metadata) : {}
+          });
+        } catch (decryptErr) {
+          console.error("[amsg:inbox] 单条解密失败，跳过", { messageId: row.messageId, error: decryptErr?.message });
+        }
+      }
+      return { status: 200, body: { success: true, data: { messages, pulledAt: now } } };
+    } catch (e) {
+      console.error("[amsg:inbox] GET 查询失败", { error: e?.message || String(e) });
+      return { status: 500, body: { success: false, error: { code: "INBOX_QUERY_FAILED", message: "拉取消息失败" } } };
+    }
+  }
+  // 方案4：POST /inbox/ack - 确认已读（删除已拉取的消息）
+  async function handleInboxAck(headers, bodyText, cfg) {
+    const userId = headers["x-user-id"];
+    if (!userId || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(userId)) {
+      return { status: 400, body: { success: false, error: { code: "INVALID_USER_ID", message: "X-User-Id 缺失或格式错误" } } };
+    }
+    let body;
+    try { body = JSON.parse(bodyText); } catch { return { status: 400, body: { success: false, error: { code: "INVALID_JSON", message: "请求体不是有效 JSON" } } }; }
+    const messageIds = Array.isArray(body?.messageIds) ? body.messageIds.filter(id => typeof id === "string" && id) : [];
+    if (messageIds.length === 0) {
+      return { status: 200, body: { success: true, data: { deleted: 0 } } };
+    }
+    const userKey = await deriveUserEncryptionKey(userId, cfg.masterKey);
+    let deleted = 0;
+    for (const messageId of messageIds) {
+      try {
+        const r = await cfg.db.prepare("DELETE FROM amsg_inbox WHERE messageId = ? AND userKey = ?").bind(messageId, userKey).run();
+        if (r?.meta?.changes > 0) deleted++;
+      } catch (e) {
+        console.error("[amsg:inbox] ack 删除失败", { messageId, error: e?.message });
+      }
+    }
+    return { status: 200, body: { success: true, data: { deleted } } };
+  }
   async function fetch2(request, env) {
     try {
       const cfg = await resolveConfig(env);
@@ -4041,6 +4150,10 @@ function createSingleUserCloudflareWorker(buildConfig) {
         result = await server.handlers.pushSubscription.GET(url, headers);
       } else if (method === "DELETE" && pathname.endsWith("/push-subscription")) {
         result = await server.handlers.pushSubscription.DELETE(url, headers);
+      } else if (method === "GET" && pathname.endsWith("/inbox")) {
+        result = await handleInboxGet(url, headers, cfg);
+      } else if (method === "POST" && pathname.endsWith("/inbox/ack")) {
+        result = await handleInboxAck(headers, await request.text(), cfg);
       } else {
         result = { status: 404, body: { success: false, error: { code: "NOT_FOUND", message: "Unknown route" } } };
       }
