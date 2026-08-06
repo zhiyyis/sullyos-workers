@@ -1961,8 +1961,13 @@ async function sendHookPushPayloads({
       push.messageIndex = i + 1;
       push.totalMessages = total;
       stampTaskIdentity(push, task, decryptedPayload, occurrenceMs);
-      await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(push));
-      sentCount++;
+      try {
+        await ctx.webpush.sendNotification(pushSubscription, JSON.stringify(push));
+        sentCount++;
+        console.log("[amsg:delivery] push ok", { index: i, messageId: push.messageId, sentCount });
+      } catch (err) {
+        console.error("[amsg:delivery] push failed", { index: i, messageId: push.messageId, error: err?.message || String(err), stack: err?.stack });
+      }
       progress.sentCount = sentCount;
       if (i < total - 1) await sleep(SLEEP_BETWEEN_MESSAGES_MS);
     }
@@ -2086,6 +2091,7 @@ async function processSingleMessage(task, ctx, providedMasterKey) {
     }
     return { success: true, messagesSent: messages.length };
   } catch (error) {
+    console.error("[amsg:delivery] processSingleMessage failed", { error: error?.message || String(error), stack: error?.stack });
     return { success: false, messagesSent: 0, error: error.message };
   }
 }
@@ -8424,6 +8430,8 @@ var fcmTokenFromEndpoint = (endpoint) => {
 var buildFcmMessage = (token, rawPayload) => {
   const payload = JSON.parse(rawPayload);
   const actualBody = String(payload.message ?? payload.body ?? "");
+  const title = String(payload.contactName ?? payload.metadata?.charName ?? "\u4E3B\u52A8\u6D88\u606F");
+  const body = actualBody.trim() || "\u6709\u4E00\u6761\u65B0\u6D88\u606F";
   const portable = { ...payload };
   delete portable.message;
   delete portable.body;
@@ -8431,21 +8439,17 @@ var buildFcmMessage = (token, rawPayload) => {
   const result = {
     message: {
       token,
-      notification: {
-        title: String(payload.contactName ?? payload.metadata?.charName ?? "\u4E3B\u52A8\u6D88\u606F"),
-        body: String(payload.notification?.body ?? actualBody).trim() || "\u6709\u4E00\u6761\u65B0\u6D88\u606F"
-      },
       data: {
         amsgPayload: JSON.stringify(portable),
-        amsgHasBody: actualBody ? "1" : "0"
+        amsgHasBody: actualBody ? "1" : "0",
+        amsgTitle: title,
+        amsgBody: body,
+        charId: typeof payload.metadata?.charId === "string" ? payload.metadata.charId : "",
+        messageId: typeof payload.messageId === "string" ? payload.messageId : "",
+        contactName: typeof payload.contactName === "string" ? payload.contactName : ""
       },
       android: {
-        priority: "high",
-        notification: {
-          channel_id: "amsg2",
-          tag: typeof payload.messageId === "string" ? payload.messageId : void 0,
-          sound: "default"
-        }
+        priority: "high"
       }
     }
   };
