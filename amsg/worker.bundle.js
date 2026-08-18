@@ -819,10 +819,13 @@ function validateNotificationArg(kind, value) {
       throw new Error(`[amsg-shared] ${kind}: 'notification.${f}' must be a string when present`);
     }
   }
-  for (const f of ["renotify", "requireInteraction", "silent"]) {
+  for (const f of ["renotify", "requireInteraction"]) {
     if (n[f] !== void 0 && typeof n[f] !== "boolean") {
       throw new Error(`[amsg-shared] ${kind}: 'notification.${f}' must be a boolean when present`);
     }
+  }
+  if (n.silent !== void 0 && typeof n.silent !== "boolean" && n.silent !== "when-visible") {
+    throw new Error(`[amsg-shared] ${kind}: 'notification.silent' must be true, false, or "when-visible"`);
   }
   if (n.data !== void 0 && (n.data === null || typeof n.data !== "object" || Array.isArray(n.data))) {
     throw new Error(`[amsg-shared] ${kind}: 'notification.data' must be a plain object when present`);
@@ -1118,7 +1121,7 @@ function stringifyDecisionForError(value) {
   }
 }
 
-// node_modules/@rei-standard/amsg-server/dist/chunk-5J73MSQ5.mjs
+// node_modules/@rei-standard/amsg-server/dist/chunk-3JEWYDM4.mjs
 var DAY_MS = 24 * 60 * 60 * 1e3;
 var MAX_LISTED_SKIPPED_OCCURRENCES = 32;
 var MAX_ADJUST_STEPS = 32;
@@ -6200,7 +6203,7 @@ function createClientStateHandler(ctx) {
   }
   return { PUT, GET, DELETE };
 }
-var SERVER_VERSION = true ? "2.6.0-next.22" : "0.0.0-dev";
+var SERVER_VERSION = true ? "2.6.0-next.23" : "0.0.0-dev";
 var SERVER_FEATURES = Object.freeze([
   "client-state",
   "client-state-chunking",
@@ -6767,7 +6770,7 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-08-15";
+var AMSG_BUNDLE_VERSION = "2026-08-18";
 
 // utils/amsgTaskKinds.ts
 var AMSG_TASK_KIND_KEY = "amsgKind";
@@ -11804,8 +11807,9 @@ var buildInstantTimelyBlock = (args) => {
   return [head, ...blocks].join("\n");
 };
 var NOTIFICATION_ALWAYS = "always";
+var NOTIFICATION_SILENT_WHEN_VISIBLE = "when-visible";
 var instantNotificationTag = (charId) => `amsg-instant-${charId}`;
-var applyInstantNotificationPolicy = (payload, charId) => {
+var applyInstantNotificationPolicy = (payload, charId, isFirstSegment = false) => {
   const notification = payload.notification;
   const hasNotification = !!notification && typeof notification === "object" && !Array.isArray(notification);
   if (!hasNotification) return payload;
@@ -11817,10 +11821,11 @@ var applyInstantNotificationPolicy = (payload, charId) => {
     notification: {
       ...notification,
       show: NOTIFICATION_ALWAYS,
-      silent: true,
+      silent: NOTIFICATION_SILENT_WHEN_VISIBLE,
       // 认不出是哪个角色时就不折叠：通知栏里多几条只是吵，两个角色共用一个 tag 会
-      // 互相顶掉，那是真的丢消息。
-      ...target ? { tag: instantNotificationTag(target) } : {}
+      // 互相顶掉，那是真的丢消息。renotify 跟着 tag 走——没有 tag 时带上它，
+      // showNotification 会直接抛 TypeError。
+      ...target ? { tag: instantNotificationTag(target), ...isFirstSegment ? { renotify: true } : {} } : {}
     }
   };
 };
@@ -12411,10 +12416,13 @@ var sendInstantErrorPush = async (args) => {
         title: args.contactName ? `${args.contactName} \u7684\u56DE\u590D\u6CA1\u80FD\u751F\u6210` : "\u56DE\u590D\u6CA1\u80FD\u751F\u6210",
         body: instantErrorNotificationBody(args.reason),
         show: "always",
-        silent: true,
+        silent: NOTIFICATION_SILENT_WHEN_VISIBLE,
         // 跟这个角色的回复共用一个 tag：通知栏里只留最新状态，重发成功后那条回复
         // 会把这条「没能生成」盖掉。失败本身在聊天流里有系统消息留痕，不靠横幅记账。
-        tag: instantNotificationTag(args.charId)
+        tag: instantNotificationTag(args.charId),
+        // 这一轮到此为止了，横幅是唯一会去叫人的东西。同 tag 默认静默替换，不带
+        // renotify 的话它会悄悄顶掉刚才那条回复通知，用户在后台就什么都不知道。
+        renotify: true
       }
     };
     await deps.webpush.sendNotification(subscription, JSON.stringify(payload));
@@ -13242,7 +13250,7 @@ var amsgHooks = {
         payloads = budgeted;
       }
       if (stash.instant) {
-        payloads = payloads.map((payload) => applyInstantNotificationPolicy(payload, stash.charId));
+        payloads = payloads.map((payload, index) => applyInstantNotificationPolicy(payload, stash.charId, index === 0));
       }
       if (payloads.length > 0) {
         await storeInboxPayloads(payloads, {
