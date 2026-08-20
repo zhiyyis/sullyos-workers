@@ -8515,6 +8515,314 @@ var buildRealtimeWorldBlock = async (args) => {
   return block;
 };
 
+// utils/amsgLlmCredentials.ts
+var charCredId = (charId, purpose) => `char:${charId}/${purpose}`;
+
+// utils/lifeRhythm.ts
+var LIFE_RHYTHM_KEY = "life_rhythm";
+var wallClockInZone = (nowMs, tzId) => {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tzId,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(new Date(nowMs));
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  let hour = parseInt(map.hour, 10);
+  if (hour === 24) hour = 0;
+  return {
+    hour,
+    minute: parseInt(map.minute, 10),
+    dateKey: `${map.year}-${map.month}-${map.day}`
+  };
+};
+var seededUnitRandom = (charId, dateKey, salt) => {
+  let hash = 2166136261;
+  const text = `${charId}\0${dateKey}\0${salt}`;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) / 4294967296;
+};
+var minutesOfDay = (hm) => {
+  const matched = /^(\d{1,2}):(\d{2})$/.exec(hm);
+  if (!matched) return null;
+  const hour = Number(matched[1]);
+  const minute = Number(matched[2]);
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  return hour * 60 + minute;
+};
+var isWithinWindow = (nowMin, start, end) => {
+  const s = minutesOfDay(start);
+  const e = minutesOfDay(end);
+  if (s === null || e === null || s === e) return false;
+  if (e > s) return nowMin >= s && nowMin < e;
+  return nowMin >= s || nowMin < e;
+};
+var tonightRhythmState = (summary, dateKey) => {
+  if (!summary.sleepStart) return "none";
+  return seededUnitRandom(summary.charId, dateKey, "tonight") < 0.8 ? "sleep" : "awake";
+};
+var evaluateLifeRhythmGate = (summary, nowMs) => {
+  if (!summary?.sleepStart || !summary.sleepEnd) return "no-window";
+  const wall = wallClockInZone(nowMs, summary.tzId || "Asia/Shanghai");
+  const nowMin = wall.hour * 60 + wall.minute;
+  if (!isWithinWindow(nowMin, summary.sleepStart, summary.sleepEnd)) return "no-window";
+  return tonightRhythmState(summary, wall.dateKey) === "sleep" ? "asleep" : "awake";
+};
+var computeAwakeMinutes = (summary, nowMs) => {
+  if (!summary?.sleepEnd) return Number.MAX_SAFE_INTEGER;
+  const endMin = minutesOfDay(summary.sleepEnd);
+  if (endMin === null) return Number.MAX_SAFE_INTEGER;
+  const wall = wallClockInZone(nowMs, summary.tzId || "Asia/Shanghai");
+  const todayStartMs = nowMs - (wall.hour * 3600 + wall.minute * 60) * 1e3;
+  const endTodayMs = todayStartMs + endMin * 6e4;
+  const candidates = [endTodayMs - 864e5, endTodayMs].filter((candidate) => candidate <= nowMs).sort((a, b) => b - a);
+  const lastEndMs = candidates[0];
+  if (lastEndMs === void 0) return Number.MAX_SAFE_INTEGER;
+  return Math.max(0, (nowMs - lastEndMs) / 6e4);
+};
+var personalityMultiplier = (personality) => {
+  switch (personality) {
+    case "clinger":
+      return 1.5;
+    case "cool":
+      return 0.6;
+    case "nightowl":
+      return 1.15;
+    case "early":
+      return 0.9;
+    default:
+      return 1;
+  }
+};
+var clampProbability = (value) => Math.max(0.01, Math.min(0.95, value));
+var moodShift = (mood) => Math.max(-0.12, Math.min(0.12, mood * 0.06));
+var replyProbability = (args) => {
+  const { awakeMinutes, personality, mood } = args;
+  let base;
+  if (awakeMinutes < 30) base = 0.3;
+  else if (awakeMinutes < 90) base = 0.55;
+  else if (awakeMinutes < 240) base = 0.75;
+  else if (awakeMinutes < 480) base = 0.9;
+  else base = 0.97;
+  return clampProbability(base * personalityMultiplier(personality) + moodShift(mood));
+};
+var autonomousProbability = (args) => {
+  const { minutesSinceUserChat, personality, mood, sinceLastAutoMinutes } = args;
+  let base;
+  if (minutesSinceUserChat < 60) base = 0.01;
+  else if (minutesSinceUserChat < 180) base = 0.06;
+  else if (minutesSinceUserChat < 360) base = 0.16;
+  else if (minutesSinceUserChat < 720) base = 0.34;
+  else if (minutesSinceUserChat < 1440) base = 0.55;
+  else base = 0.72;
+  let probability = base * personalityMultiplier(personality) + moodShift(mood);
+  if (sinceLastAutoMinutes < 180) probability *= 0.2;
+  else if (sinceLastAutoMinutes < 360) probability *= 0.6;
+  return clampProbability(probability);
+};
+
+// worker/amsg/src/lifeRhythmProbe.ts
+var VALID_PERSONALITIES = ["clinger", "normal", "cool", "nightowl", "early"];
+var parseSummary = (plain) => {
+  try {
+    const parsed = JSON.parse(plain);
+    if (!parsed || parsed.v !== 1) return null;
+    if (typeof parsed.charId !== "string" || !parsed.charId) return null;
+    if (typeof parsed.charName !== "string" || !parsed.charName) return null;
+    if (typeof parsed.amsg2Enabled !== "boolean") return null;
+    if (typeof parsed.tzId !== "string" || !parsed.tzId) return null;
+    if (typeof parsed.lastUserChatAt !== "number") return null;
+    if (typeof parsed.pendingReply !== "boolean") return null;
+    if (parsed.sleepStart !== null && typeof parsed.sleepStart !== "string") return null;
+    if (parsed.sleepEnd !== null && typeof parsed.sleepEnd !== "string") return null;
+    if (!VALID_PERSONALITIES.includes(parsed.personality)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+};
+var bytesToBase642 = (bytes) => {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 32768) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
+  }
+  return btoa(binary);
+};
+var hexToBytes2 = (hex) => {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i += 1) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return bytes;
+};
+var encryptRequestPayload = async (plaintext, userKeyHex) => {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    hexToBytes2(userKeyHex),
+    { name: "AES-GCM" },
+    false,
+    ["encrypt"]
+  );
+  const cipherBuf = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, tagLength: 128 },
+    key,
+    new TextEncoder().encode(plaintext)
+  );
+  const cipherArr = new Uint8Array(cipherBuf);
+  return {
+    iv: bytesToBase642(iv),
+    authTag: bytesToBase642(cipherArr.slice(cipherArr.length - 16)),
+    encryptedData: bytesToBase642(cipherArr.slice(0, cipherArr.length - 16))
+  };
+};
+var runLifeRhythmProbe = async (deps) => {
+  const now = (deps.now ?? Date.now)();
+  const { db, masterKey } = deps;
+  if (!db || !masterKey) return;
+  const userRow = await db.prepare("SELECT user_id FROM client_state WHERE key = ? LIMIT 1").bind(LIFE_RHYTHM_KEY).first().catch(() => null);
+  if (!userRow?.user_id) return;
+  const userId = userRow.user_id;
+  const userKey = await deriveUserEncryptionKey(userId, masterKey);
+  const pendingByChar = /* @__PURE__ */ new Map();
+  try {
+    const pendingRows = await db.prepare("SELECT encrypted_payload FROM scheduled_messages WHERE user_id = ? AND status = ?").bind(userId, "pending").all();
+    for (const row of pendingRows.results ?? []) {
+      try {
+        const plain = await decryptFromStorage(String(row.encrypted_payload), userKey);
+        const parsed = JSON.parse(plain);
+        const charId = parsed.metadata?.charId;
+        if (typeof charId === "string" && charId) {
+          pendingByChar.set(charId, (pendingByChar.get(charId) ?? 0) + 1);
+        }
+      } catch {
+      }
+    }
+  } catch {
+    return;
+  }
+  const rows = await db.prepare("SELECT namespace, value FROM client_state WHERE user_id = ? AND key = ?").bind(userId, LIFE_RHYTHM_KEY).all().catch(() => null);
+  if (!rows?.results) return;
+  for (const row of rows.results) {
+    try {
+      await probeOneCharacter({
+        ...deps,
+        now,
+        userId,
+        userKey,
+        pendingByChar,
+        summaryRow: row
+      });
+    } catch (error) {
+      console.error("[amsg:life-probe] \u5355\u4E2A\u89D2\u8272\u5904\u7406\u5931\u8D25\uFF08\u4E0D\u5F71\u54CD\u5176\u4ED6\u89D2\u8272\uFF09", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+};
+var probeOneCharacter = async (args) => {
+  const { db, now, userId, userKey, pendingByChar, summaryRow, postScheduleMessage } = args;
+  const summary = parseSummary(await decryptFromStorage(String(summaryRow.value), userKey));
+  if (!summary) return;
+  if (!summary.amsg2Enabled) return;
+  if (evaluateLifeRhythmGate(summary, now) === "asleep") return;
+  const charNs = amsgStateNamespace(summary.charId);
+  const stateKeys = await db.prepare("SELECT key FROM client_state WHERE user_id = ? AND namespace = ? AND key IN (?, ?)").bind(userId, charNs, AMSG_FIRE_PACK_KEY, AMSG_TOOL_PACK_KEY).all();
+  const present = new Set((stateKeys.results ?? []).map((r) => r.key));
+  if (!present.has(AMSG_FIRE_PACK_KEY) || !present.has(AMSG_TOOL_PACK_KEY)) return;
+  const toolConfigRow = await db.prepare("SELECT 1 AS ok FROM client_state WHERE user_id = ? AND namespace = ? AND key = ?").bind(userId, AMSG_GLOBAL_NAMESPACE, AMSG_TOOL_CONFIG_KEY).first().catch(() => null);
+  if (!toolConfigRow) return;
+  if ((pendingByChar.get(summary.charId) ?? 0) >= MAX_ACTIVE_TASKS_PER_CHAR) return;
+  const wall = wallClockInZone(now, summary.tzId);
+  const slotKey = `${wall.dateKey}#${Math.floor((wall.hour * 60 + wall.minute) / 15)}`;
+  const minutesSinceUserChat = Math.max(0, (now - summary.lastUserChatAt) / 6e4);
+  const sinceLastAutoMinutes = summary.lastAutoAt != null ? Math.max(0, (now - summary.lastAutoAt) / 6e4) : Number.MAX_SAFE_INTEGER;
+  const awakeMinutes = computeAwakeMinutes(summary, now);
+  let action;
+  let probability = 0;
+  if (summary.pendingReply) {
+    probability = replyProbability({
+      awakeMinutes,
+      personality: summary.personality,
+      mood: summary.mood
+    });
+    action = seededUnitRandom(summary.charId, slotKey, "life-reply") < probability ? "reply" : "none";
+  } else {
+    probability = autonomousProbability({
+      minutesSinceUserChat,
+      personality: summary.personality,
+      mood: summary.mood,
+      sinceLastAutoMinutes
+    });
+    action = seededUnitRandom(summary.charId, slotKey, "life-auto") < probability ? "auto" : "none";
+  }
+  if (action === "none") return;
+  const instruction = action === "reply" ? [
+    "\u8FD9\u662F\u4E00\u6761\u7531\u300C\u751F\u6D3B\u8282\u594F\u300D\u89E6\u53D1\u7684\u56DE\u7559\u8A00\u6D88\u606F\u3002",
+    "\u4F60\u7761\u7740\uFF08\u6216\u6CA1\u987E\u4E0A\uFF09\u671F\u95F4\u5BF9\u65B9\u7ED9\u4F60\u7559\u4E86\u6D88\u606F\uFF0C\u73B0\u5728\u4F60\u770B\u5230\u4E86\uFF0C\u5148\u81EA\u7136\u56DE\u5E94\u5BF9\u65B9\u90A3\u6761\u7559\u8A00\uFF0C",
+    "\u50CF\u771F\u4EBA\u9192\u6765\u770B\u5230\u6D88\u606F\u540E\u7684\u53CD\u5E94\uFF0C\u4E0D\u7528\u523B\u610F\u89E3\u91CA\u300C\u6211\u521A\u624D\u5728\u7761\u89C9\u300D\uFF0C\u518D\u987A\u5176\u81EA\u7136\u804A\u4E0B\u53BB\u3002"
+  ].join("\n") : buildTaskInstruction("auto");
+  const taskUuid = crypto.randomUUID();
+  const payload = {
+    contactName: summary.charName,
+    messageType: "auto",
+    messageSubtype: "chat",
+    immediate: true,
+    recurrenceType: "none",
+    tzId: summary.tzId,
+    metadata: {
+      charId: summary.charId,
+      charName: summary.charName,
+      source: "active_msg_2",
+      amsgMode: "auto",
+      amsgClientTaskId: `${taskUuid}-c`,
+      amsgExpirePolicy: "expire",
+      // 锚点 = 摘要里的最后一条真实用户消息；用户再开口，防穿帮闸会让这次触发作废。
+      amsgAnchorMs: summary.lastUserChatAt,
+      amsgTaskInstruction: instruction,
+      // 自排标记：到点兜底闸（连发上限）只拦带它的任务，跟角色在聊天里自排的同一套。
+      amsgSelfScheduled: true
+    },
+    messages: [{ role: "user", content: "AMSG2_PLACEHOLDER_PROMPT\uFF08\u6B63\u5F0F prompt \u5230\u70B9\u7531 worker onBeforeFire \u4E0B\u53D1\uFF1B\u770B\u5230\u8FD9\u6761\u8BF4\u660E fire hooks \u672A\u751F\u6548\uFF09" }],
+    credRefs: { chat: charCredId(summary.charId, "chat") }
+  };
+  const encryptedBody = JSON.stringify(await encryptRequestPayload(JSON.stringify(payload), userKey));
+  const result = await postScheduleMessage({ userId, encryptedBody });
+  if (!result.ok) {
+    console.warn("[amsg:life-probe] \u6392\u81EA\u4E3B\u4EFB\u52A1\u5931\u8D25\uFF08\u4E0B\u4E2A\u65F6\u95F4\u69FD\u518D\u8BD5\uFF09", {
+      charId: summary.charId,
+      action,
+      probability: Math.round(probability * 1e3) / 1e3,
+      status: result.status,
+      code: readScheduleErrorCode(result.body)
+    });
+    return;
+  }
+  const updated = {
+    ...summary,
+    ...action === "reply" ? { pendingReply: false } : {},
+    ...action === "auto" ? { lastAutoAt: now } : {},
+    updatedAt: now
+  };
+  await db.prepare(
+    "INSERT INTO client_state (user_id, namespace, key, value, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (user_id, namespace, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+  ).bind(userId, charNs, LIFE_RHYTHM_KEY, await encryptForStorage(JSON.stringify(updated), userKey), now).run();
+  console.log("[amsg:life-probe] \u5DF2\u6392", {
+    charId: summary.charId,
+    action,
+    probability: Math.round(probability * 1e3) / 1e3
+  });
+};
+var readScheduleErrorCode = (body) => {
+  const err5 = body?.error;
+  return typeof err5?.code === "string" && err5.code ? err5.code : null;
+};
+
 // utils/mcpFireCore.ts
 var DEFAULT_MAX_TOOL_NAME_LEN = 64;
 var MCP_FIRE_NAME_PREFIX = "mcp__";
@@ -13741,6 +14049,32 @@ var readServerVersion = async (request, env) => {
     return null;
   }
 };
+var postLifeRhythmProbeTask = (env) => async (request) => {
+  const headers = {
+    "Content-Type": "application/json",
+    "X-User-Id": request.userId,
+    "X-Payload-Encrypted": "true",
+    "X-Encryption-Version": "1"
+  };
+  const serverToken = env.AMSG_SERVER_TOKEN?.trim();
+  if (serverToken) headers["X-Client-Token"] = serverToken;
+  let status = 0;
+  let body = null;
+  try {
+    const response = await upstream.fetch(new Request("https://amsg.internal/schedule-message", {
+      method: "POST",
+      headers,
+      body: request.encryptedBody
+    }), env);
+    status = response.status;
+    body = await response.json().catch(() => null);
+  } catch (error) {
+    console.error("[amsg:life-probe] \u5EFA\u4EFB\u52A1\u8BF7\u6C42\u672C\u8EAB\u5931\u8D25", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+  return { ok: status >= 200 && status < 300, status, body };
+};
 var src_default = {
   async fetch(request, env) {
     const pathname = new URL(request.url).pathname.replace(/\/+$/, "") || "/";
@@ -13933,6 +14267,17 @@ var src_default = {
     if (!report.ok) {
       console.error(`[amsg] \u5B9A\u65F6\u4EFB\u52A1\u6574\u8F6E\u8DF3\u8FC7\uFF1A${report.message}`);
       return;
+    }
+    try {
+      await runLifeRhythmProbe({
+        db: env.DB,
+        masterKey: env.AMSG_MASTER_KEY?.trim() || "",
+        postScheduleMessage: postLifeRhythmProbeTask(env)
+      });
+    } catch (error) {
+      console.error("[amsg:life-probe] \u63A2\u9488\u6574\u8F6E\u5931\u8D25\uFF08\u4E0D\u5F71\u54CD\u5B9A\u65F6\u4EFB\u52A1\uFF09", {
+        error: error instanceof Error ? error.message : String(error)
+      });
     }
     await upstream.scheduled(event, env);
   }
