@@ -6770,7 +6770,7 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-08-21";
+var AMSG_BUNDLE_VERSION = "2026-08-21.2";
 
 // utils/amsgTaskKinds.ts
 var AMSG_TASK_KIND_KEY = "amsgKind";
@@ -8730,6 +8730,7 @@ var probeOneCharacter = async (args) => {
   const summary = parseSummary(await decryptFromStorage(String(summaryRow.value), userKey));
   if (!summary) return;
   if (!summary.amsg2Enabled) return;
+  if (summary.lifeRhythmEnabled === false) return;
   if (evaluateLifeRhythmGate(summary, now) === "asleep") return;
   const charNs = amsgStateNamespace(summary.charId);
   const stateKeys = await db.prepare("SELECT key FROM client_state WHERE user_id = ? AND namespace = ? AND key IN (?, ?)").bind(userId, charNs, AMSG_FIRE_PACK_KEY, AMSG_TOOL_PACK_KEY).all();
