@@ -6770,7 +6770,7 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-08-22.2";
+var AMSG_BUNDLE_VERSION = "2026-08-22.3";
 
 // utils/amsgTaskKinds.ts
 var AMSG_TASK_KIND_KEY = "amsgKind";
@@ -8566,6 +8566,44 @@ var minutesOfDay = (hm) => {
   if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
   return hour * 60 + minute;
 };
+var buildBusyWindows = (slots, dateKey) => {
+  if (!slots || slots.length === 0) return buildBusyFallback(dateKey);
+  const restfulRegex = /睡|眠|觉|躺|饭|餐|吃|休|放松|自由|发呆|放空|赖床|躺平|宅|摸鱼|划水|闲聊|聊天|摆烂|追剧|看剧|看番|动漫|视频|刷|游戏|电影|综艺|直播|听歌|音乐|唱歌|阅读|看书|读书|小说|漫画|散步|遛|逛街|购物|买菜|运动|健身|锻炼|跑步|慢跑|游泳|瑜伽|球|爬山|骑行|骑车|钓鱼|摄影|画画|绘画|写日记|手工|烘焙|做饭|烹饪|家务|打扫|收拾|洗衣|洗澡|洗漱|护肤|化妆|按摩|泡澡|泡脚|养生|冥想|打坐|弹琴|吉他|钢琴|乐器|跳舞|公园|约会|朋友|聚会|聚餐|撸|宠物|花草|园艺|通勤|上下班|路上|地铁|公交|开车|日出|日落|星星/;
+  const blocks = [];
+  for (let i = 0; i < slots.length; i += 1) {
+    const blob = `${slots[i].activity} ${slots[i].description || ""}`;
+    if (restfulRegex.test(blob)) continue;
+    const start = minutesOfDay(slots[i].startTime);
+    if (start === null) continue;
+    const nextStart = slots[i + 1] ? minutesOfDay(slots[i + 1].startTime) : null;
+    let end = nextStart ?? (start + 480) % 1440;
+    if (end === start) continue;
+    let span = end > start ? end - start : end + 1440 - start;
+    if (span > 480) {
+      end = (start + 480) % 1440;
+      span = 480;
+    }
+    const last = blocks[blocks.length - 1];
+    if (last && start <= last.e) {
+      if (end > last.e) last.e = end;
+    } else {
+      blocks.push({ s: start, e: end });
+    }
+  }
+  const pad = (n) => n.toString().padStart(2, "0");
+  return blocks.map((b) => ({
+    start: `${pad(Math.floor(b.s / 60))}:${pad(b.s % 60)}`,
+    end: `${pad(Math.floor(b.e / 60))}:${pad(b.e % 60)}`
+  }));
+};
+var buildBusyFallback = (dateKey) => {
+  if (!dateKey) return [];
+  const [y, m, d] = dateKey.split("-").map(Number);
+  if (!y || !m || !d) return [];
+  const weekday = new Date(y, m - 1, d).getDay();
+  if (weekday === 0 || weekday === 6) return [];
+  return [{ start: "07:30", end: "12:00" }, { start: "13:00", end: "18:20" }];
+};
 var isWithinAnyWindow = (nowMin, windows) => {
   if (!windows || windows.length === 0) return false;
   return windows.some((w) => isWithinWindow(nowMin, w.start, w.end));
@@ -8591,18 +8629,6 @@ var evaluateLifeRhythmGate = (summary, nowMs) => {
   const diceDateKey = startMin !== null && endMin !== null && endMin < startMin && nowMin < endMin ? previousDateKey(wall.dateKey) : wall.dateKey;
   return tonightRhythmState(summary, diceDateKey) === "sleep" ? "asleep" : "awake";
 };
-var computeAwakeMinutes = (summary, nowMs) => {
-  if (!summary?.sleepEnd) return Number.MAX_SAFE_INTEGER;
-  const endMin = minutesOfDay(summary.sleepEnd);
-  if (endMin === null) return Number.MAX_SAFE_INTEGER;
-  const wall = wallClockInZone(nowMs, summary.tzId || "Asia/Shanghai");
-  const todayStartMs = nowMs - (wall.hour * 3600 + wall.minute * 60) * 1e3;
-  const endTodayMs = todayStartMs + endMin * 6e4;
-  const candidates = [endTodayMs - 864e5, endTodayMs].filter((candidate) => candidate <= nowMs).sort((a, b) => b - a);
-  const lastEndMs = candidates[0];
-  if (lastEndMs === void 0) return Number.MAX_SAFE_INTEGER;
-  return Math.max(0, (nowMs - lastEndMs) / 6e4);
-};
 var personalityMultiplier = (personality) => {
   switch (personality) {
     case "clinger":
@@ -8619,15 +8645,9 @@ var personalityMultiplier = (personality) => {
 };
 var clampProbability = (value) => Math.max(0.01, Math.min(0.95, value));
 var moodShift = (mood) => Math.max(-0.12, Math.min(0.12, mood * 0.06));
-var replyProbability = (args) => {
-  const { awakeMinutes, personality, mood } = args;
-  let base;
-  if (awakeMinutes < 30) base = 0.3;
-  else if (awakeMinutes < 90) base = 0.55;
-  else if (awakeMinutes < 240) base = 0.75;
-  else if (awakeMinutes < 480) base = 0.9;
-  else base = 0.97;
-  return clampProbability(base * personalityMultiplier(personality) + moodShift(mood));
+var replyWindowProbability = (args) => {
+  const base = 0.3 + clamp01(args.availability) * 0.35;
+  return clampProbability(base * personalityMultiplier(args.personality) + moodShift(args.mood));
 };
 var autonomousProbability = (args) => {
   const { minutesSinceUserChat, personality, mood, sinceLastAutoMinutes } = args;
@@ -8643,7 +8663,184 @@ var autonomousProbability = (args) => {
   else if (sinceLastAutoMinutes < 360) probability *= 0.6;
   return clampProbability(probability);
 };
+var DEFAULT_LIFE_BEHAVIOR = {
+  mealAvailability: 0.5,
+  workAvailability: 0.2,
+  restAvailability: 0.8,
+  socialAvailability: 0.65,
+  microBreakChance: 0.15
+};
+var AVAILABLE_AVAILABILITY = 0.9;
+var MICRO_BREAK_AVAILABILITY = 0.55;
+var REPLY_WINDOW_MIN_AVAILABILITY = 0.5;
+var REPLY_WINDOW_CHUNK_MIN = 120;
 var WAKE_CONTEXT_FRESH_MS = 3 * 60 * 60 * 1e3;
+var lifeBehaviorForPersonality = (personality) => {
+  switch (personality) {
+    case "clinger":
+      return { mealAvailability: 0.65, workAvailability: 0.25, restAvailability: 0.9, microBreakChance: 0.25 };
+    case "cool":
+      return { mealAvailability: 0.35, workAvailability: 0.12, restAvailability: 0.6, microBreakChance: 0.08 };
+    case "nightowl":
+      return { mealAvailability: 0.55, workAvailability: 0.3, restAvailability: 0.85, microBreakChance: 0.2 };
+    case "early":
+      return { mealAvailability: 0.45, workAvailability: 0.18, restAvailability: 0.75, microBreakChance: 0.12 };
+    default:
+      return {};
+  }
+};
+var clamp01 = (value) => Math.max(0, Math.min(1, value));
+var MEAL_ACTIVITY_RE = /饭|餐|吃|早茶|早餐|午餐|晚餐|宵夜|夜宵|brunch|零食/;
+var SOCIAL_ACTIVITY_RE = /约会|聚会|聚餐|朋友|闺蜜|兄弟|见面|聊天|闲聊|唠/;
+var REST_ACTIVITY_RE = /休|放松|自由|发呆|放空|赖床|躺平|宅|摸鱼|划水|追剧|看剧|看番|动漫|视频|刷|游戏|电影|综艺|直播|听歌|音乐|唱歌|阅读|看书|读书|小说|漫画|散步|遛|逛街|购物|买菜|运动|健身|锻炼|跑步|慢跑|游泳|瑜伽|爬山|骑行|骑车|钓鱼|摄影|画画|绘画|写日记|手工|烘焙|做饭|烹饪|家务|打扫|收拾|洗衣|洗澡|洗漱|护肤|化妆|按摩|泡澡|泡脚|养生|冥想|打坐|弹琴|吉他|钢琴|乐器|跳舞|公园|撸|宠物|花草|园艺|通勤|上下班|路上|地铁|公交|开车/;
+var classifyActivity = (activity, description) => {
+  const blob = `${activity} ${description || ""}`;
+  if (MEAL_ACTIVITY_RE.test(blob)) return "meal";
+  if (SOCIAL_ACTIVITY_RE.test(blob)) return "social";
+  if (REST_ACTIVITY_RE.test(blob)) return "rest";
+  return "work";
+};
+var availabilityForActivity = (activityClass, profile = {}) => {
+  switch (activityClass) {
+    case "meal":
+      return clamp01(profile.mealAvailability ?? DEFAULT_LIFE_BEHAVIOR.mealAvailability);
+    case "work":
+      return clamp01(profile.workAvailability ?? DEFAULT_LIFE_BEHAVIOR.workAvailability);
+    case "rest":
+      return clamp01(profile.restAvailability ?? DEFAULT_LIFE_BEHAVIOR.restAvailability);
+    case "social":
+      return clamp01(profile.socialAvailability ?? DEFAULT_LIFE_BEHAVIOR.socialAvailability);
+  }
+};
+var currentScheduleSlot = (slots, nowMin) => {
+  if (!slots || slots.length === 0) return null;
+  for (let i = 0; i < slots.length; i += 1) {
+    const startMin = minutesOfDay(slots[i].startTime);
+    if (startMin === null) continue;
+    const nextMin = i + 1 < slots.length ? minutesOfDay(slots[i + 1].startTime) : null;
+    const endMin = nextMin !== null ? nextMin : 1440;
+    if (nowMin >= startMin && nowMin < endMin) return { slot: slots[i], endMin };
+  }
+  return null;
+};
+var computeLifeState = (args) => {
+  const { summary, schedule, nowMs, profile } = args;
+  const wall = wallClockInZone(nowMs, summary.tzId || "Asia/Shanghai");
+  const nowMin = wall.hour * 60 + wall.minute;
+  const pad = (n) => n.toString().padStart(2, "0");
+  const todayStartMs = nowMs - nowMin * 6e4;
+  const endMsOf = (endMin) => {
+    const endMs = todayStartMs + endMin * 6e4;
+    return endMs > nowMs ? endMs : endMs + 864e5;
+  };
+  if (evaluateLifeRhythmGate(summary, nowMs) === "asleep") {
+    const endMin = minutesOfDay(summary.sleepEnd);
+    return {
+      state: "sleeping",
+      availability: 0,
+      startedAt: summary.sleepStart ?? null,
+      expectedEndAt: summary.sleepEnd ?? null,
+      source: "sleep-window",
+      nextAvailableAt: endMin !== null ? endMsOf(endMin) : null
+    };
+  }
+  const current = currentScheduleSlot(schedule?.slots, nowMin);
+  if (current) {
+    const activityClass = classifyActivity(current.slot.activity, current.slot.description);
+    let availability = availabilityForActivity(activityClass, profile);
+    if (activityClass === "work" && availability < MICRO_BREAK_AVAILABILITY) {
+      const chance = profile?.microBreakChance ?? DEFAULT_LIFE_BEHAVIOR.microBreakChance;
+      const slotKey = `${wall.dateKey}#${Math.floor(nowMin / 15)}`;
+      if (seededUnitRandom(summary.charId, slotKey, "life-micro-break") < chance) {
+        availability = MICRO_BREAK_AVAILABILITY;
+      }
+    }
+    return {
+      state: "busy",
+      availability: Math.round(availability * 100) / 100,
+      startedAt: current.slot.startTime,
+      expectedEndAt: `${pad(Math.floor(current.endMin / 60))}:${pad(current.endMin % 60)}`,
+      source: "schedule",
+      nextAvailableAt: endMsOf(current.endMin)
+    };
+  }
+  const busyWindows = buildBusyWindows(schedule?.slots, wall.dateKey);
+  if (isWithinAnyWindow(nowMin, busyWindows)) {
+    return {
+      state: "busy",
+      availability: Math.round(availabilityForActivity("work", profile) * 100) / 100,
+      startedAt: null,
+      expectedEndAt: null,
+      source: "fallback",
+      nextAvailableAt: null
+    };
+  }
+  return {
+    state: "available",
+    availability: AVAILABLE_AVAILABILITY,
+    startedAt: null,
+    expectedEndAt: null,
+    source: schedule?.slots?.length ? "gap" : "fallback",
+    nextAvailableAt: null
+  };
+};
+var slotEdgesMinutes = (slots) => {
+  if (!slots?.length) return [];
+  const edges = [];
+  for (let i = 0; i < slots.length; i += 1) {
+    const start = minutesOfDay(slots[i].startTime);
+    if (start === null) continue;
+    const next = i + 1 < slots.length ? minutesOfDay(slots[i + 1].startTime) : null;
+    edges.push({ start, end: next !== null ? next : 1440 });
+  }
+  return edges;
+};
+var busyWindowsMinutes = (windows) => windows.map((w) => ({ start: minutesOfDay(w.start), end: minutesOfDay(w.end) })).filter((e) => e.start !== null && e.end !== null && e.start !== e.end);
+var gapAroundMinutes = (edges, nowMin) => {
+  const merged = [];
+  for (const edge of [...edges].sort((a, b) => a.start - b.start)) {
+    const last = merged[merged.length - 1];
+    if (last && edge.start <= last.end) last.end = Math.max(last.end, edge.end);
+    else merged.push({ start: edge.start, end: edge.end });
+  }
+  let cursor = 0;
+  for (const edge of merged) {
+    if (nowMin < edge.start) return { start: cursor, end: edge.start };
+    cursor = Math.max(cursor, edge.end);
+  }
+  return { start: cursor, end: 1440 };
+};
+var evaluateReplyWindow = (args) => {
+  const { summary, scene, nowMs, profile } = args;
+  const wall = wallClockInZone(nowMs, summary.tzId || "Asia/Shanghai");
+  const nowMin = wall.hour * 60 + wall.minute;
+  const schedule = scene?.dateKey === wall.dateKey ? scene.schedule : null;
+  const life = computeLifeState({ summary, schedule, nowMs, profile });
+  if (life.state === "sleeping") return null;
+  if (life.state === "busy" && life.availability < REPLY_WINDOW_MIN_AVAILABILITY) return null;
+  const pad = (n) => `${String(Math.floor(n / 60)).padStart(2, "0")}:${String(n % 60).padStart(2, "0")}`;
+  if (life.source === "schedule") {
+    const start = life.startedAt ?? "00:00";
+    const end = life.expectedEndAt ?? "23:59";
+    return { key: `${wall.dateKey}#${start}-${end}`, start, end, availability: life.availability, source: "schedule" };
+  }
+  const edges = schedule?.slots?.length ? slotEdgesMinutes(schedule.slots) : busyWindowsMinutes(buildBusyWindows(schedule?.slots, wall.dateKey));
+  const gap = gapAroundMinutes(edges, nowMin);
+  let startMin = gap.start;
+  let endMin = gap.end;
+  if (endMin - startMin > REPLY_WINDOW_CHUNK_MIN) {
+    const block = Math.floor((nowMin - startMin) / REPLY_WINDOW_CHUNK_MIN);
+    startMin += block * REPLY_WINDOW_CHUNK_MIN;
+    endMin = Math.min(endMin, startMin + REPLY_WINDOW_CHUNK_MIN);
+  }
+  return {
+    key: `${wall.dateKey}#${pad(startMin)}-${pad(endMin)}`,
+    start: pad(startMin),
+    end: pad(endMin),
+    availability: AVAILABLE_AVAILABILITY,
+    source: life.source
+  };
+};
 
 // worker/amsg/src/lifeRhythmProbe.ts
 var VALID_PERSONALITIES = ["clinger", "normal", "cool", "nightowl", "early"];
@@ -8709,8 +8906,9 @@ var runLifeRhythmProbe = async (deps) => {
   const userId = userRow.user_id;
   const userKey = await deriveUserEncryptionKey(userId, masterKey);
   const pendingByChar = /* @__PURE__ */ new Map();
+  const pendingTasksByChar = /* @__PURE__ */ new Map();
   try {
-    const pendingRows = await db.prepare("SELECT encrypted_payload FROM scheduled_messages WHERE user_id = ? AND status = ?").bind(userId, "pending").all();
+    const pendingRows = await db.prepare("SELECT encrypted_payload, next_send_at FROM scheduled_messages WHERE user_id = ? AND status = ?").bind(userId, "pending").all();
     for (const row of pendingRows.results ?? []) {
       try {
         const plain = await decryptFromStorage(String(row.encrypted_payload), userKey);
@@ -8718,6 +8916,13 @@ var runLifeRhythmProbe = async (deps) => {
         const charId = parsed.metadata?.charId;
         if (typeof charId === "string" && charId) {
           pendingByChar.set(charId, (pendingByChar.get(charId) ?? 0) + 1);
+          const list = pendingTasksByChar.get(charId) ?? [];
+          const nextAt = row.next_send_at != null ? Date.parse(String(row.next_send_at)) : NaN;
+          list.push({
+            source: typeof parsed.metadata?.source === "string" ? parsed.metadata.source : null,
+            nextSendAtMs: Number.isFinite(nextAt) ? nextAt : null
+          });
+          pendingTasksByChar.set(charId, list);
         }
       } catch {
       }
@@ -8735,6 +8940,7 @@ var runLifeRhythmProbe = async (deps) => {
         userId,
         userKey,
         pendingByChar,
+        pendingTasksByChar,
         summaryRow: row
       });
     } catch (error) {
@@ -8745,7 +8951,7 @@ var runLifeRhythmProbe = async (deps) => {
   }
 };
 var probeOneCharacter = async (args) => {
-  const { db, now, userId, userKey, pendingByChar, summaryRow, postScheduleMessage } = args;
+  const { db, now, userId, userKey, pendingByChar, pendingTasksByChar, summaryRow, postScheduleMessage } = args;
   const summary = parseSummary(await decryptFromStorage(String(summaryRow.value), userKey));
   if (!summary) return;
   if (!summary.amsg2Enabled) return;
@@ -8762,17 +8968,26 @@ var probeOneCharacter = async (args) => {
   const slotKey = `${wall.dateKey}#${Math.floor((wall.hour * 60 + wall.minute) / 15)}`;
   const minutesSinceUserChat = Math.max(0, (now - summary.lastUserChatAt) / 6e4);
   const sinceLastAutoMinutes = summary.lastAutoAt != null ? Math.max(0, (now - summary.lastAutoAt) / 6e4) : Number.MAX_SAFE_INTEGER;
-  const awakeMinutes = computeAwakeMinutes(summary, now);
+  const pendingTasks = pendingTasksByChar.get(summary.charId) ?? [];
   let action;
   let probability = 0;
   if (summary.pendingReply) {
-    probability = replyProbability({
-      awakeMinutes,
+    if (pendingTasks.some((t) => t.source === "deferred_reply")) return;
+    const replyWindow = evaluateReplyWindow({
+      summary,
+      scene: await readFireScene(db, userId, userKey, charNs),
+      nowMs: now,
+      profile: lifeBehaviorForPersonality(summary.personality)
+    });
+    if (!replyWindow) return;
+    probability = replyWindowProbability({
+      availability: replyWindow.availability,
       personality: summary.personality,
       mood: summary.mood
     });
-    action = seededUnitRandom(summary.charId, slotKey, "life-reply") < probability ? "reply" : "none";
+    action = seededUnitRandom(summary.charId, replyWindow.key, "life-reply-window") < probability ? "reply" : "none";
   } else {
+    if (shouldYieldAutoContact(summary, pendingTasks, now)) return;
     if (autoCountForDay(summary, wall.dateKey) >= DAILY_LIFE_AUTO_CAP) {
       console.log("[amsg:life-probe] \u5F53\u65E5\u81EA\u4E3B\u6D88\u606F\u5DF2\u8FBE\u4E0A\u9650\uFF0C\u8DF3\u8FC7", { charId: summary.charId, count: autoCountForDay(summary, wall.dateKey) });
       return;
@@ -8805,15 +9020,17 @@ var probeOneCharacter = async (args) => {
     metadata: {
       charId: summary.charId,
       charName: summary.charName,
-      source: "active_msg_2",
+      // 来源标记：回留言 / 自主联系分开，fire 收尾（④让路、清 pendingReply、self_log
+      // reply 标记）都靠它认人；别再依赖 amsgSelfScheduled（③④曾共享同一字段）。
+      source: action === "reply" ? "deferred_reply" : "autonomous_contact",
       amsgMode: "auto",
       amsgClientTaskId: `${taskUuid}-c`,
       amsgExpirePolicy: "expire",
       // 锚点 = 摘要里的最后一条真实用户消息；用户再开口，防穿帮闸会让这次触发作废。
       amsgAnchorMs: summary.lastUserChatAt,
       amsgTaskInstruction: instruction,
-      // 自排标记：到点兜底闸（连发上限）只拦带它的任务，跟角色在聊天里自排的同一套。
-      amsgSelfScheduled: true
+      // 自排标记：④要过到点兜底闸（连发上限）；⑤是回用户的消息，不受「角色自己连发」闸管。
+      ...action === "auto" ? { amsgSelfScheduled: true } : {}
     },
     messages: [{ role: "user", content: "AMSG2_PLACEHOLDER_PROMPT\uFF08\u6B63\u5F0F prompt \u5230\u70B9\u7531 worker onBeforeFire \u4E0B\u53D1\uFF1B\u770B\u5230\u8FD9\u6761\u8BF4\u660E fire hooks \u672A\u751F\u6548\uFF09" }],
     credRefs: { chat: charCredId(summary.charId, "chat") }
@@ -8832,7 +9049,7 @@ var probeOneCharacter = async (args) => {
   }
   const updated = {
     ...summary,
-    ...action === "reply" ? { pendingReply: false } : {},
+    ...action === "reply" ? { pendingReply: true, replyTaskPendingAt: now } : {},
     ...action === "auto" ? { lastAutoAt: now, autoDateKey: wall.dateKey, autoCount: autoCountForDay(summary, wall.dateKey) + 1 } : {},
     updatedAt: now
   };
@@ -8848,6 +9065,86 @@ var probeOneCharacter = async (args) => {
 var readScheduleErrorCode = (body) => {
   const err5 = body?.error;
   return typeof err5?.code === "string" && err5.code ? err5.code : null;
+};
+var YIELD_NEAR_TASK_MS = ACTIVE_CHAT_WINDOW_MS;
+var YIELD_MAX_OVERDUE_MS = 60 * 60 * 1e3;
+var shouldYieldAutoContact = (summary, pendingTasks, nowMs) => {
+  if (summary.pendingReply) return true;
+  return pendingTasks.some((task) => {
+    if (task.source === "autonomous_contact" || task.source === "deferred_reply") return false;
+    if (task.nextSendAtMs == null || !Number.isFinite(task.nextSendAtMs)) return false;
+    const until = task.nextSendAtMs - nowMs;
+    return until <= YIELD_NEAR_TASK_MS && until >= -YIELD_MAX_OVERDUE_MS;
+  });
+};
+var STATE_CHUNK_ROOT_PREFIX = "amsg-chunkedv1";
+var STATE_CHUNK_NS_PREFIX = "amsg-chunks";
+var isChunkedRootValue = (value) => value.startsWith(STATE_CHUNK_ROOT_PREFIX) && /^[1-9][0-9]*$/.test(value.slice(STATE_CHUNK_ROOT_PREFIX.length));
+var readStateValue = async (db, userId, userKey, namespace, key, value) => {
+  try {
+    let raw = value;
+    if (isChunkedRootValue(raw)) {
+      const count = Number(raw.slice(STATE_CHUNK_ROOT_PREFIX.length));
+      const chunkRows = await db.prepare("SELECT key, value FROM client_state WHERE user_id = ? AND namespace = ? AND key LIKE ?").bind(userId, STATE_CHUNK_NS_PREFIX + namespace, `${key}%`).all();
+      const parts = [];
+      for (let i = 0; i < count; i += 1) {
+        const chunk = (chunkRows.results ?? []).find((r) => r.key === `${key}${i}`);
+        if (!chunk) return null;
+        parts.push(await decryptFromStorage(String(chunk.value), userKey));
+      }
+      raw = parts.join("");
+    } else {
+      raw = await decryptFromStorage(raw, userKey);
+    }
+    return await unpackStateValue(raw);
+  } catch {
+    return null;
+  }
+};
+var readFireScene = async (db, userId, userKey, charNs) => {
+  const row = await db.prepare("SELECT value FROM client_state WHERE user_id = ? AND namespace = ? AND key = ?").bind(userId, charNs, AMSG_FIRE_PACK_KEY).first().catch(() => null);
+  if (!row?.value) return null;
+  const plain = await readStateValue(db, userId, userKey, charNs, AMSG_FIRE_PACK_KEY, String(row.value));
+  if (!plain) return null;
+  try {
+    const parsed = JSON.parse(plain);
+    return parsed.scene ?? null;
+  } catch {
+    return null;
+  }
+};
+var lifeRhythmSettleDeps = null;
+var configureLifeRhythmSettle = (deps) => {
+  lifeRhythmSettleDeps = deps;
+};
+var settleDeferredReply = async (args) => {
+  const deps = lifeRhythmSettleDeps;
+  if (!deps?.db || !deps.masterKey) return false;
+  const now = args.now ?? deps.now?.() ?? Date.now();
+  try {
+    const row = await deps.db.prepare("SELECT value FROM client_state WHERE user_id = ? AND namespace = ? AND key = ?").bind(args.userId, amsgStateNamespace(args.charId), LIFE_RHYTHM_KEY).first();
+    if (!row?.value) return false;
+    const userKey = await deriveUserEncryptionKey(args.userId, deps.masterKey);
+    const plain = await decryptFromStorage(String(row.value), userKey);
+    const parsed = JSON.parse(plain);
+    if (!parsed || typeof parsed.pendingReply !== "boolean" || parsed.charId !== args.charId) return false;
+    const updated = {
+      ...parsed,
+      ...args.outcome === "sent" ? { pendingReply: false } : {},
+      replyTaskPendingAt: null,
+      updatedAt: now
+    };
+    await deps.db.prepare(
+      "INSERT INTO client_state (user_id, namespace, key, value, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (user_id, namespace, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+    ).bind(args.userId, amsgStateNamespace(args.charId), LIFE_RHYTHM_KEY, await encryptForStorage(JSON.stringify(updated), userKey), now).run();
+    return true;
+  } catch (error) {
+    console.warn("[amsg:life-probe] \u56DE\u7559\u8A00\u6536\u5C3E\u8BB0\u8D26\u5931\u8D25\uFF08\u4E0B\u6B21\u7A97\u53E3\u53EF\u80FD\u91CD\u6392\uFF0C\u9632\u7A7F\u5E2E\u95F8\u515C\u5E95\uFF09", {
+      charId: args.charId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return false;
+  }
 };
 
 // utils/mcpFireCore.ts
@@ -12870,6 +13167,19 @@ var sendInstantErrorPush = async (args) => {
   }
 };
 var amsgFireSettled = async (info) => {
+  const replyTask = info.metadata?.source === "deferred_reply";
+  if (replyTask) {
+    const charId = typeof info.metadata?.charId === "string" ? info.metadata.charId : null;
+    const taskRow = info.task;
+    const userId = typeof taskRow?.user_id === "string" ? taskRow.user_id : null;
+    if (charId && userId) {
+      await settleDeferredReply({
+        charId,
+        userId,
+        outcome: info.status === "sent" && (info.sentCount ?? 0) > 0 ? "sent" : "not-sent"
+      });
+    }
+  }
   const stash = getFireStash(info.scratch);
   if (!stash) return;
   if (stash.instant && info.status === "failed" && stash.taskUuid) {
@@ -12931,9 +13241,9 @@ var amsgFireSettled = async (info) => {
       id: `${stash.clientTaskId || "task"}@${stash.occurrenceMs}`,
       at: Date.now(),
       text,
-      // 即时对话是在答用户刚说的话——列进自述块保持连续性，但不占「主动连发」的额度
-      // （带这个标记的条目不会让 selfLog.unansweredSends 加一）。
-      ...stash.instant ? { reply: true } : {}
+      // 即时对话 / ⑤回留言都是在答用户刚说的话——列进自述块保持连续性，但不占
+      // 「主动连发」的额度（带这个标记的条目不会让 selfLog.unansweredSends 加一）。
+      ...stash.instant || replyTask ? { reply: true } : {}
     });
     if (next !== stash.selfLog) {
       stash.selfLog = next;
@@ -13809,6 +14119,7 @@ var buildWorkerConfig = (env) => {
   const webpush = createHybridPushTransport(env, createWebCryptoWebPush(effectiveVapid));
   configureInstantErrorPush(env.DB && env.AMSG_MASTER_KEY ? { webpush, db: env.DB, masterKey: env.AMSG_MASTER_KEY } : null);
   configureInboxStore(env.DB && env.AMSG_MASTER_KEY ? { db: env.DB, masterKey: env.AMSG_MASTER_KEY } : null);
+  configureLifeRhythmSettle(env.DB && env.AMSG_MASTER_KEY ? { db: env.DB, masterKey: env.AMSG_MASTER_KEY } : null);
   return {
     // db 缺省时 factory 自动用 createD1Adapter(env.DB)
     masterKey: env.AMSG_MASTER_KEY,
