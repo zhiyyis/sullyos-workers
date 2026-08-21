@@ -6770,7 +6770,7 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-08-21.3";
+var AMSG_BUNDLE_VERSION = "2026-08-21.4";
 
 // utils/amsgTaskKinds.ts
 var AMSG_TASK_KIND_KEY = "amsgKind";
@@ -8559,6 +8559,10 @@ var minutesOfDay = (hm) => {
   if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
   return hour * 60 + minute;
 };
+var isWithinAnyWindow = (nowMin, windows) => {
+  if (!windows || windows.length === 0) return false;
+  return windows.some((w) => isWithinWindow(nowMin, w.start, w.end));
+};
 var isWithinWindow = (nowMin, start, end) => {
   const s = minutesOfDay(start);
   const e = minutesOfDay(end);
@@ -8766,7 +8770,7 @@ var probeOneCharacter = async (args) => {
       mood: summary.mood,
       sinceLastAutoMinutes
     });
-    if (isWithinWindow(wall.hour * 60 + wall.minute, summary.busyStart, summary.busyEnd)) probability *= 0.2;
+    if (isWithinAnyWindow(wall.hour * 60 + wall.minute, summary.busyWindows)) probability *= 0.2;
     action = seededUnitRandom(summary.charId, slotKey, "life-auto") < probability ? "auto" : "none";
   }
   if (action === "none") return;
