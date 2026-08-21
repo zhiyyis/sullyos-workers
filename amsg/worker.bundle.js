@@ -6770,7 +6770,7 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-08-21.4";
+var AMSG_BUNDLE_VERSION = "2026-08-22";
 
 // utils/amsgTaskKinds.ts
 var AMSG_TASK_KIND_KEY = "amsgKind";
@@ -8542,6 +8542,13 @@ var wallClockInZone = (nowMs, tzId) => {
     dateKey: `${map.year}-${map.month}-${map.day}`
   };
 };
+var previousDateKey = (dateKey) => {
+  const [year, month, day] = dateKey.split("-").map(Number);
+  const previous = new Date(Date.UTC(year, month - 1, day));
+  previous.setUTCDate(previous.getUTCDate() - 1);
+  const pad = (n) => n.toString().padStart(2, "0");
+  return `${previous.getUTCFullYear()}-${pad(previous.getUTCMonth() + 1)}-${pad(previous.getUTCDate())}`;
+};
 var seededUnitRandom = (charId, dateKey, salt) => {
   let hash = 2166136261;
   const text = `${charId}\0${dateKey}\0${salt}`;
@@ -8579,7 +8586,10 @@ var evaluateLifeRhythmGate = (summary, nowMs) => {
   const wall = wallClockInZone(nowMs, summary.tzId || "Asia/Shanghai");
   const nowMin = wall.hour * 60 + wall.minute;
   if (!isWithinWindow(nowMin, summary.sleepStart, summary.sleepEnd)) return "no-window";
-  return tonightRhythmState(summary, wall.dateKey) === "sleep" ? "asleep" : "awake";
+  const startMin = minutesOfDay(summary.sleepStart);
+  const endMin = minutesOfDay(summary.sleepEnd);
+  const diceDateKey = startMin !== null && endMin !== null && endMin < startMin && nowMin < endMin ? previousDateKey(wall.dateKey) : wall.dateKey;
+  return tonightRhythmState(summary, diceDateKey) === "sleep" ? "asleep" : "awake";
 };
 var computeAwakeMinutes = (summary, nowMs) => {
   if (!summary?.sleepEnd) return Number.MAX_SAFE_INTEGER;
