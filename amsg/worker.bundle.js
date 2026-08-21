@@ -6770,7 +6770,7 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-08-22";
+var AMSG_BUNDLE_VERSION = "2026-08-22.2";
 
 // utils/amsgTaskKinds.ts
 var AMSG_TASK_KIND_KEY = "amsgKind";
@@ -8643,6 +8643,7 @@ var autonomousProbability = (args) => {
   else if (sinceLastAutoMinutes < 360) probability *= 0.6;
   return clampProbability(probability);
 };
+var WAKE_CONTEXT_FRESH_MS = 3 * 60 * 60 * 1e3;
 
 // worker/amsg/src/lifeRhythmProbe.ts
 var VALID_PERSONALITIES = ["clinger", "normal", "cool", "nightowl", "early"];
@@ -8659,6 +8660,8 @@ var parseSummary = (plain) => {
     if (parsed.sleepStart !== null && typeof parsed.sleepStart !== "string") return null;
     if (parsed.sleepEnd !== null && typeof parsed.sleepEnd !== "string") return null;
     if (!VALID_PERSONALITIES.includes(parsed.personality)) return null;
+    if (parsed.currentState !== void 0 && !["sleeping", "busy", "available"].includes(parsed.currentState)) return null;
+    if (parsed.availability !== void 0 && (typeof parsed.availability !== "number" || parsed.availability < 0 || parsed.availability > 1)) return null;
     return parsed;
   } catch {
     return null;
@@ -8780,7 +8783,8 @@ var probeOneCharacter = async (args) => {
       mood: summary.mood,
       sinceLastAutoMinutes
     });
-    if (isWithinAnyWindow(wall.hour * 60 + wall.minute, summary.busyWindows)) probability *= 0.2;
+    const availabilityFactor = typeof summary.availability === "number" ? Math.max(0.01, Math.min(1, summary.availability)) : isWithinAnyWindow(wall.hour * 60 + wall.minute, summary.busyWindows) ? 0.2 : 1;
+    probability *= availabilityFactor;
     action = seededUnitRandom(summary.charId, slotKey, "life-auto") < probability ? "auto" : "none";
   }
   if (action === "none") return;
