@@ -6770,7 +6770,7 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-08-21.2";
+var AMSG_BUNDLE_VERSION = "2026-08-21.3";
 
 // utils/amsgTaskKinds.ts
 var AMSG_TASK_KIND_KEY = "amsgKind";
@@ -8520,6 +8520,8 @@ var charCredId = (charId, purpose) => `char:${charId}/${purpose}`;
 
 // utils/lifeRhythm.ts
 var LIFE_RHYTHM_KEY = "life_rhythm";
+var DAILY_LIFE_AUTO_CAP = 8;
+var autoCountForDay = (summary, dateKey) => summary.autoDateKey === dateKey ? summary.autoCount || 0 : 0;
 var wallClockInZone = (nowMs, tzId) => {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: tzId,
@@ -8550,7 +8552,7 @@ var seededUnitRandom = (charId, dateKey, salt) => {
   return (hash >>> 0) / 4294967296;
 };
 var minutesOfDay = (hm) => {
-  const matched = /^(\d{1,2}):(\d{2})$/.exec(hm);
+  const matched = /^(\d{1,2}):(\d{2})$/.exec(hm ?? "");
   if (!matched) return null;
   const hour = Number(matched[1]);
   const minute = Number(matched[2]);
@@ -8754,12 +8756,17 @@ var probeOneCharacter = async (args) => {
     });
     action = seededUnitRandom(summary.charId, slotKey, "life-reply") < probability ? "reply" : "none";
   } else {
+    if (autoCountForDay(summary, wall.dateKey) >= DAILY_LIFE_AUTO_CAP) {
+      console.log("[amsg:life-probe] \u5F53\u65E5\u81EA\u4E3B\u6D88\u606F\u5DF2\u8FBE\u4E0A\u9650\uFF0C\u8DF3\u8FC7", { charId: summary.charId, count: autoCountForDay(summary, wall.dateKey) });
+      return;
+    }
     probability = autonomousProbability({
       minutesSinceUserChat,
       personality: summary.personality,
       mood: summary.mood,
       sinceLastAutoMinutes
     });
+    if (isWithinWindow(wall.hour * 60 + wall.minute, summary.busyStart, summary.busyEnd)) probability *= 0.2;
     action = seededUnitRandom(summary.charId, slotKey, "life-auto") < probability ? "auto" : "none";
   }
   if (action === "none") return;
@@ -8807,7 +8814,7 @@ var probeOneCharacter = async (args) => {
   const updated = {
     ...summary,
     ...action === "reply" ? { pendingReply: false } : {},
-    ...action === "auto" ? { lastAutoAt: now } : {},
+    ...action === "auto" ? { lastAutoAt: now, autoDateKey: wall.dateKey, autoCount: autoCountForDay(summary, wall.dateKey) + 1 } : {},
     updatedAt: now
   };
   await db.prepare(
