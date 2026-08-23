@@ -6770,7 +6770,7 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-08-22.3";
+var AMSG_BUNDLE_VERSION = "2026-08-23.1";
 
 // utils/amsgTaskKinds.ts
 var AMSG_TASK_KIND_KEY = "amsgKind";
@@ -12877,7 +12877,9 @@ var sendFcmNotification = async (env, token, payload) => {
   );
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
-    throw new Error(`FCM_SEND_FAILED (${response.status}): ${detail.slice(0, 500)}`);
+    const error = new Error(`FCM_SEND_FAILED (${response.status}): ${detail.slice(0, 500)}`);
+    error.statusCode = response.status;
+    throw error;
   }
 };
 var createHybridPushTransport = (env, webPush) => ({
