@@ -8620,6 +8620,10 @@ var tonightRhythmState = (summary, dateKey) => {
   return seededUnitRandom(summary.charId, dateKey, "tonight") < 0.8 ? "sleep" : "awake";
 };
 var evaluateLifeRhythmGate = (summary, nowMs) => {
+  const override = summary?.sleepOverride;
+  if (override && nowMs < override.until) {
+    return override.state === "sleeping" ? "asleep" : "awake";
+  }
   if (!summary?.sleepStart || !summary.sleepEnd) return "no-window";
   const wall = wallClockInZone(nowMs, summary.tzId || "Asia/Shanghai");
   const nowMin = wall.hour * 60 + wall.minute;
@@ -8674,7 +8678,7 @@ var AVAILABLE_AVAILABILITY = 0.9;
 var MICRO_BREAK_AVAILABILITY = 0.55;
 var REPLY_WINDOW_MIN_AVAILABILITY = 0.5;
 var REPLY_WINDOW_CHUNK_MIN = 120;
-var WAKE_CONTEXT_FRESH_MS = 3 * 60 * 60 * 1e3;
+var WAKE_CONTEXT_FRESH_MS = 30 * 60 * 1e3;
 var lifeBehaviorForPersonality = (personality) => {
   switch (personality) {
     case "clinger":
