@@ -6770,7 +6770,7 @@ function createSingleUserCloudflareWorker(buildConfig, options = {}) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-08-30.1";
+var AMSG_BUNDLE_VERSION = "2026-08-30.2";
 
 // utils/amsgTaskKinds.ts
 var AMSG_TASK_KIND_KEY = "amsgKind";
@@ -8619,6 +8619,10 @@ var evaluateLifeRhythmGate = (summary, nowMs) => {
   if (override && nowMs < override.until) {
     return override.state === "sleeping" ? "asleep" : "awake";
   }
+  const tempWake = summary?.tempWake;
+  if (tempWake && typeof tempWake.until === "number" && nowMs < tempWake.until) {
+    return "awake";
+  }
   if (!summary?.sleepStart || !summary.sleepEnd) return "no-window";
   const wall = wallClockInZone(nowMs, summary.tzId || "Asia/Shanghai");
   const nowMin = wall.hour * 60 + wall.minute;
@@ -8674,6 +8678,8 @@ var MICRO_BREAK_AVAILABILITY = 0.55;
 var REPLY_WINDOW_MIN_AVAILABILITY = 0.5;
 var REPLY_WINDOW_CHUNK_MIN = 120;
 var WAKE_CONTEXT_FRESH_MS = 30 * 60 * 1e3;
+var CHAR_AWAKE_FRESH_MS = 30 * 60 * 1e3;
+var TEMP_WAKE_EXTEND_MS = 15 * 60 * 1e3;
 var lifeBehaviorForPersonality = (personality) => {
   switch (personality) {
     case "clinger":
