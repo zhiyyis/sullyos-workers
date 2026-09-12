@@ -3,7 +3,7 @@
 // worker/amsg/src/index.ts
 import { DurableObject } from "cloudflare:workers";
 
-// node_modules/.pnpm/@rei-standard+amsg-server@2_fb4635af9fd862ec3ac8704599825d6b/node_modules/@rei-standard/amsg-server/dist/chunk-GN44PST5.mjs
+// node_modules/.pnpm/@rei-standard+amsg-server@2_ea16286aaa16251b49227e44a96f6568/node_modules/@rei-standard/amsg-server/dist/chunk-GN44PST5.mjs
 var UPDATABLE_COLUMNS = /* @__PURE__ */ new Set([
   "user_id",
   "uuid",
@@ -1136,7 +1136,7 @@ function stringifyDecisionForError(value) {
   }
 }
 
-// node_modules/.pnpm/@rei-standard+amsg-server@2_fb4635af9fd862ec3ac8704599825d6b/node_modules/@rei-standard/amsg-server/dist/chunk-4YH3TS4W.mjs
+// node_modules/.pnpm/@rei-standard+amsg-server@2_ea16286aaa16251b49227e44a96f6568/node_modules/@rei-standard/amsg-server/dist/chunk-FPVXATA4.mjs
 var DAY_MS = 24 * 60 * 60 * 1e3;
 var MAX_LISTED_SKIPPED_OCCURRENCES = 32;
 var MAX_ADJUST_STEPS = 32;
@@ -2133,7 +2133,7 @@ async function writeClientStateEntries({ db, userId, userKey, entries, now }) {
   const cleanups = [];
   const rootRowIndexes = [];
   const rootRowEntries = [];
-  let deleted = 0;
+  const deletions = [];
   for (const entry of entries) {
     const rawGuardAt = Number.isInteger(entry.version) && entry.version > 0 ? entry.version : entry.updatedAt;
     const guardAt = Math.min(rawGuardAt, at);
@@ -2143,12 +2143,12 @@ async function writeClientStateEntries({ db, userId, userKey, entries, now }) {
       updatedAt: guardAt
     });
     if (entry.value === null) {
+      deletions.push({ cleanupIndex: cleanups.length, entry });
       cleanups.push({
         namespace: entry.namespace,
         key: entry.key,
         updatedAt: guardAt
       });
-      deleted++;
       continue;
     }
     rootRowIndexes.push(physicalRows.length);
@@ -2185,6 +2185,7 @@ async function writeClientStateEntries({ db, userId, userKey, entries, now }) {
   const result = await db.upsertClientState(userId, physicalRows, cleanups, at);
   let upserted = 0;
   let skipped = 0;
+  let deleted = 0;
   const skippedEntries = [];
   if (Array.isArray(result.outcomes) && result.outcomes.length === physicalRows.length) {
     for (let i = 0; i < rootRowIndexes.length; i++) {
@@ -2199,6 +2200,15 @@ async function writeClientStateEntries({ db, userId, userKey, entries, now }) {
   } else {
     upserted = result.upserted;
     skipped = result.skipped;
+  }
+  const cleanupOutcomes = Array.isArray(result.cleanupOutcomes) && result.cleanupOutcomes.length === cleanups.length ? result.cleanupOutcomes : null;
+  for (const { cleanupIndex, entry } of deletions) {
+    if (cleanupOutcomes && cleanupOutcomes[cleanupIndex] === false) {
+      skipped++;
+      skippedEntries.push({ namespace: entry.namespace, key: entry.key });
+    } else {
+      deleted++;
+    }
   }
   return { upserted, skipped, deleted, skippedEntries };
 }
@@ -5147,6 +5157,19 @@ var CLIENT_STATE_TABLE_SQL = `
     PRIMARY KEY (user_id, namespace, key)
   )
 `;
+var CLIENT_STATE_INDEXES = [
+  {
+    name: "idx_client_state_cleanup",
+    // 服务 cleanupClientState 的
+    //   DELETE FROM client_state WHERE namespace = ? AND updated_at < ?
+    // 主键 (user_id, namespace, key) 最左列是 user_id，按 namespace 起头的条件
+    // 吃不到它。
+    sql: `CREATE INDEX IF NOT EXISTS idx_client_state_cleanup
+          ON client_state (namespace, updated_at)`,
+    description: "TTL cleanup index (cleanupClientState by namespace + updated_at)",
+    critical: false
+  }
+];
 var PUSH_SUBSCRIPTION_TABLE_SQL = `
   CREATE TABLE IF NOT EXISTS push_subscriptions (
     user_id TEXT PRIMARY KEY,
@@ -5180,11 +5203,57 @@ var MESSAGE_OUTBOX_TABLE_SQL = `
     UNIQUE (user_id, message_id)
   )
 `;
-var MESSAGE_OUTBOX_INDEX_SQL = `
-  CREATE INDEX IF NOT EXISTS idx_outbox_unacked
-    ON message_outbox (user_id, id)
-    WHERE acked_at IS NULL
-`;
+var MESSAGE_OUTBOX_INDEXES = [
+  {
+    name: "idx_outbox_unacked",
+    // 服务 listUnackedOutbox 的
+    //   SELECT … WHERE user_id = ? AND acked_at IS NULL AND id > ? ORDER BY id
+    sql: `CREATE INDEX IF NOT EXISTS idx_outbox_unacked
+          ON message_outbox (user_id, id)
+          WHERE acked_at IS NULL`,
+    description: "Unacked outbox paging index (GET /outbox)",
+    critical: false
+  },
+  {
+    name: "idx_outbox_created",
+    // 服务 cleanupOutbox 的
+    //   DELETE FROM message_outbox WHERE created_at < ?
+    sql: `CREATE INDEX IF NOT EXISTS idx_outbox_created
+          ON message_outbox (created_at)`,
+    description: "Outbox retention cleanup index (cleanupOutbox by created_at)",
+    critical: false
+  },
+  {
+    name: "idx_outbox_acked",
+    // 服务 cleanupOutbox 的
+    //   DELETE FROM message_outbox WHERE acked_at IS NOT NULL AND acked_at < ?
+    // 部分索引只收已 ack 的行：未 ack 的那部分本来就不是这条语句的目标，
+    // idx_outbox_unacked 的 WHERE 条件与它正好互补。
+    sql: `CREATE INDEX IF NOT EXISTS idx_outbox_acked
+          ON message_outbox (acked_at)
+          WHERE acked_at IS NOT NULL`,
+    description: "Acked outbox cleanup index (cleanupOutbox by acked_at)",
+    critical: false
+  },
+  {
+    name: "idx_outbox_task_undelivered",
+    // 服务 discardUndeliveredOutboxForTask 的
+    //   DELETE FROM message_outbox
+    //   WHERE user_id = ? AND task_uuid = ? AND delivered_at IS NULL AND acked_at IS NULL
+    // 没有它这条只能靶着 user_id 走 (user_id, message_id) 或 idx_outbox_unacked，
+    // 单用户部署下 user_id 对每一行都成立，等于把整个未 ack 积压扫一遍。
+    sql: `CREATE INDEX IF NOT EXISTS idx_outbox_task_undelivered
+          ON message_outbox (user_id, task_uuid)
+          WHERE delivered_at IS NULL AND acked_at IS NULL`,
+    description: "Undelivered-by-task discard index (cancel / supersede)",
+    critical: false
+  }
+];
+var SQLITE_ALL_INDEXES = [
+  ...SQLITE_INDEXES,
+  ...CLIENT_STATE_INDEXES,
+  ...MESSAGE_OUTBOX_INDEXES
+];
 function parseTableName(sql) {
   const match = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)/i.exec(sql);
   return match ? match[1] : "";
@@ -5219,7 +5288,7 @@ var SQLITE_REQUIRED_SCHEMA = Object.freeze({
     describeTable(LLM_CREDENTIALS_TABLE_SQL),
     describeTable(MESSAGE_OUTBOX_TABLE_SQL)
   ])),
-  indexes: Object.freeze(SQLITE_INDEXES.filter((index) => index.critical).map((index) => index.name))
+  indexes: Object.freeze(SQLITE_ALL_INDEXES.filter((index) => index.critical).map((index) => index.name))
 });
 function prefixRangeEnd(prefix) {
   const points = Array.from(prefix);
@@ -5322,7 +5391,6 @@ var D1Adapter = class {
     await this._db.prepare(PUSH_SUBSCRIPTION_TABLE_SQL).run();
     await this._db.prepare(LLM_CREDENTIALS_TABLE_SQL).run();
     await this._db.prepare(MESSAGE_OUTBOX_TABLE_SQL).run();
-    await this._db.prepare(MESSAGE_OUTBOX_INDEX_SQL).run();
     for (const migration of SQLITE_MIGRATIONS) {
       try {
         await this._db.prepare(migration.sql).run();
@@ -5331,7 +5399,7 @@ var D1Adapter = class {
       }
     }
     const indexResults = [];
-    for (const index of SQLITE_INDEXES) {
+    for (const index of SQLITE_ALL_INDEXES) {
       try {
         await this._db.prepare(index.sql).run();
         indexResults.push({ name: index.name, status: "success", description: index.description, critical: !!index.critical });
@@ -5700,8 +5768,11 @@ var D1Adapter = class {
    * @param {number} [now] - 服务端当前时刻（epoch 毫秒），判定「这行来自未来」用的
    *   就是它。调用方（lib/client-state-store.js）传下来，测试可以钉住一个假时钟；
    *   自定义调用方不传时退回本机时钟。
-   * @returns {Promise<{ upserted: number, skipped: number, outcomes: boolean[] }>}
+   * @returns {Promise<{ upserted: number, skipped: number, outcomes: boolean[], cleanupOutcomes?: Array<boolean|null> }>}
    *   `outcomes[i]` 对应 entries[i] 是否真的写入（changes > 0）。
+   *   `cleanupOutcomes[i]` 对应 cleanups[i]（传了 cleanups 才有）：精确 key 形态
+   *   回 `true` = 这个 key 的行已经不在（删掉了，或本来就没有）、`false` = 行还在
+   *   （库里那行更新，删除被条件写拦下）；前缀形态不探测，回 `null`。
    */
   async upsertClientState(userId, entries, cleanups = [], now = Date.now()) {
     const UPSERT_SQL = `INSERT INTO client_state (user_id, namespace, key, value, updated_at)
@@ -5717,29 +5788,53 @@ var D1Adapter = class {
     const CLEANUP_KEY_SQL = `DELETE FROM client_state
        WHERE user_id = ? AND namespace = ? AND key = ?
          AND (updated_at <= ? OR updated_at > ?)`;
-    const buildStatements = () => [
-      ...cleanups.map((c) => typeof c.key === "string" ? this._db.prepare(CLEANUP_KEY_SQL).bind(userId, c.namespace, c.key, c.updatedAt, now) : this._db.prepare(CLEANUP_PREFIX_SQL).bind(userId, c.namespace, c.keyPrefix, prefixRangeEnd(c.keyPrefix), c.updatedAt, now)),
-      ...entries.map(
-        (entry) => this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt, now)
-      )
-    ];
+    const PROBE_KEY_SQL = `SELECT COUNT(*) AS n FROM client_state
+       WHERE user_id = ? AND namespace = ? AND key = ?`;
+    const statements = [];
+    const probeIndexes = [];
+    for (const c of cleanups) {
+      if (typeof c.key === "string") {
+        statements.push(this._db.prepare(CLEANUP_KEY_SQL).bind(userId, c.namespace, c.key, c.updatedAt, now));
+        probeIndexes.push(statements.length);
+        statements.push(this._db.prepare(PROBE_KEY_SQL).bind(userId, c.namespace, c.key));
+      } else {
+        statements.push(
+          this._db.prepare(CLEANUP_PREFIX_SQL).bind(userId, c.namespace, c.keyPrefix, prefixRangeEnd(c.keyPrefix), c.updatedAt, now)
+        );
+        probeIndexes.push(null);
+      }
+    }
+    const upsertStart = statements.length;
+    for (const entry of entries) {
+      statements.push(
+        this._db.prepare(UPSERT_SQL).bind(userId, entry.namespace, entry.key, entry.value, entry.updatedAt, now)
+      );
+    }
     let results;
     if (typeof this._db.batch === "function") {
-      results = await this._db.batch(buildStatements());
+      results = await this._db.batch(statements);
     } else {
       results = [];
-      for (const stmt of buildStatements()) {
+      for (const stmt of statements) {
         results.push(await stmt.run());
       }
     }
-    const outcomes = results.slice(cleanups.length).map((res) => res.meta.changes > 0);
+    const outcomes = results.slice(upsertStart).map((res) => res.meta.changes > 0);
     let upserted = 0;
     let skipped = 0;
     for (const wrote of outcomes) {
       if (wrote) upserted++;
       else skipped++;
     }
-    return { upserted, skipped, outcomes };
+    const result = { upserted, skipped, outcomes };
+    if (cleanups.length > 0) {
+      result.cleanupOutcomes = probeIndexes.map((probeAt) => {
+        if (probeAt === null) return null;
+        const row = results[probeAt] && Array.isArray(results[probeAt].results) ? results[probeAt].results[0] : null;
+        return Number(row?.n ?? 0) === 0;
+      });
+    }
+    return result;
   }
   /**
    * All entries of one namespace (values still encrypted).
@@ -6218,12 +6313,14 @@ function validateEntry(entry, index, maxValueBytes) {
   if (INTERNAL_STATE_CHAR_RE.test(entry.key)) {
     return rejectEntry(entry, index, "INVALID_STATE_KEY", `entries[${index}].key \u4E0D\u80FD\u5305\u542B\u63A7\u5236\u5B57\u7B26\uFF08\\u0000-\\u001f \u4E3A\u5E93\u5185\u90E8\u4FDD\u7559\uFF09`);
   }
-  if (typeof entry.value !== "string") {
-    return rejectEntry(entry, index, "INVALID_STATE_VALUE", `entries[${index}].value \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\uFF08\u5BBF\u4E3B\u81EA\u884C\u5E8F\u5217\u5316\uFF09`);
+  if (entry.value !== null && typeof entry.value !== "string") {
+    return rejectEntry(entry, index, "INVALID_STATE_VALUE", `entries[${index}].value \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\uFF08\u5BBF\u4E3B\u81EA\u884C\u5E8F\u5217\u5316\uFF09\uFF0C\u6216 null \u8868\u793A\u5220\u9664`);
   }
-  const bytes = stateValueBytes(entry.value);
-  if (bytes > maxValueBytes) {
-    return rejectEntry(entry, index, "STATE_VALUE_TOO_LARGE", `entries[${index}].value \u8D85\u8FC7\u5355\u6761\u603B\u4E0A\u9650`, { bytes, maxBytes: maxValueBytes });
+  if (typeof entry.value === "string") {
+    const bytes = stateValueBytes(entry.value);
+    if (bytes > maxValueBytes) {
+      return rejectEntry(entry, index, "STATE_VALUE_TOO_LARGE", `entries[${index}].value \u8D85\u8FC7\u5355\u6761\u603B\u4E0A\u9650`, { bytes, maxBytes: maxValueBytes });
+    }
   }
   if (!Number.isInteger(entry.updatedAt) || entry.updatedAt <= 0) {
     return rejectEntry(entry, index, "INVALID_STATE_UPDATED_AT", `entries[${index}].updatedAt \u5FC5\u987B\u662F\u6B63\u6574\u6570\uFF08epoch \u6BEB\u79D2\uFF09`);
@@ -6284,8 +6381,9 @@ function createClientStateHandler(ctx) {
     if (typeof db.upsertClientState !== "function") {
       return err3(501, "CLIENT_STATE_NOT_SUPPORTED", "\u5F53\u524D\u6570\u636E\u5E93\u9002\u914D\u5668\u4E0D\u652F\u6301 client_state");
     }
-    const { upserted, skipped, skippedEntries } = await writeClientStateEntries({ db, userId, userKey, entries: accepted });
+    const { upserted, skipped, deleted, skippedEntries } = await writeClientStateEntries({ db, userId, userKey, entries: accepted });
     const data = { upserted, skipped };
+    if (deleted > 0) data.deleted = deleted;
     if (skippedEntries.length > 0) data.skippedEntries = skippedEntries;
     if (rejected.length > 0) data.rejected = rejected;
     return { status: 200, body: { success: true, data } };
@@ -6330,7 +6428,7 @@ function createClientStateHandler(ctx) {
   }
   return { PUT, GET, DELETE };
 }
-var SERVER_VERSION = true ? "2.6.0-next.26" : "0.0.0-dev";
+var SERVER_VERSION = true ? "2.6.0-next.27" : "0.0.0-dev";
 var SERVER_FEATURES = Object.freeze([
   "client-state",
   "client-state-chunking",
@@ -6414,7 +6512,10 @@ var SERVER_FEATURES = Object.freeze([
   // client_state 按命名空间过期清理（config 的 clientStateTtl，cron 每跳顺手做）。
   "client-state-ttl",
   // hook ctx 带 emitResult(payload)：往客户端补一条自定义结果（落收件箱 + 推送）。
-  "emit-result"
+  "emit-result",
+  // PUT /client-state 的 entry 认 value: null（删掉这个 key，连切片行一起；同一套
+  // last-write-wins，被拦下的进 skippedEntries；删掉的条数在 data.deleted）。
+  "client-state-delete"
 ]);
 function createCapabilitiesHandler(ctx) {
   async function GET(url, headers) {
@@ -6990,7 +7091,7 @@ function stripReasoningTags2(content) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-09-12.1";
+var AMSG_BUNDLE_VERSION = "2026-09-12.2";
 
 // utils/amsgTaskKinds.ts
 var AMSG_TASK_KIND_KEY = "amsgKind";
@@ -7362,6 +7463,7 @@ var buildScheduleInjection = (schedule, evolvedNarrative, now = /* @__PURE__ */ 
 `;
   const footnote = `
 \uFF08\u4E0D\u662F\u53F0\u8BCD\uFF0C\u4E0D\u7528\u8BF4\u51FA\u53E3\u2014\u2014\u8BA9\u5B83\u5F71\u54CD\u4F60\u7684\u8BED\u6C14\u548C\u60C5\u7EEA\u5C31\u597D\u3002\uFF09`;
+  const scopeNote = "\uFF08\u8FD9\u5F20\u8868\u662F\u4F60\u81EA\u5DF1\u7684\u4E00\u5929\uFF0C\u4E0D\u662F\u7ED9\u5BF9\u65B9\u5217\u7684\u5F85\u529E\u3002\u91CC\u5934\u8981\u662F\u6709\u8DDF\u5BF9\u65B9\u76F8\u5173\u7684\u4E8B\uFF0C\u90A3\u4E5F\u662F\u4F60\u81EA\u5DF1\u7684\u60E6\u8BB0\u2014\u2014\u8BDD\u8D76\u5230\u4E86\u987A\u53E3\u5E26\u4E00\u53E5\u5C31\u591F\uFF0C\u4E0D\u7528\u8FFD\u7740\u95EE\u8FDB\u5C55\uFF0C\u4E5F\u4E0D\u7528\u50AC\u5BF9\u65B9\u53BB\u505A\u3002\uFF09";
   let out = "";
   if (options.includeFullDay) {
     const rows = schedule.slots.map((slot) => {
@@ -7384,6 +7486,8 @@ ${rows.join("\n")}
 \u65E5\u7A0B\u662F\u4F60\u65E9\u4E0A\u7ED9\u81EA\u5DF1\u6392\u7684\u8BA1\u5212\uFF0C\u4E0D\u662F\u5FC5\u987B\u5C65\u884C\u7684\u547D\u4EE4\u3002\u771F\u5B9E\u53D1\u751F\u7684\u4E8B\u8DDF\u5B83\u5BF9\u4E0D\u4E0A\u65F6\uFF08\u6BD4\u5982\u8FD9\u4F1A\u513F\u8868\u4E0A\u5199\u7740\u7761\u89C9\u3001\u4F60\u5374\u9192\u7740\u5728\u8DDF\u5BF9\u65B9\u8BF4\u8BDD\uFF09\uFF0C\u628A\u5B83\u6539\u6210\u4F60\u5B9E\u9645\u5728\u505A\u7684\u4E8B\u5C31\u597D\u3002
 \u9700\u8981\u65F6\u5728\u56DE\u590D\u672B\u5C3E\u5355\u72EC\u8F93\u51FA\uFF1A[[ACTION:CHANGE_SCHEDULE | ${changeTarget.startTime} | \u53BB\u8D85\u5E02]]\uFF08\u65F6\u6BB5\u8981\u539F\u6837\u6284\u4E0A\u9762\u51FA\u73B0\u8FC7\u7684\u90A3\u51E0\u4E2A\uFF1B\u6B63\u5728\u8FDB\u884C\u7684\u8FD9\u4E00\u6761\u548C\u5B83\u4E4B\u540E\u7684\u90FD\u80FD\u6539\uFF0C\u5DF2\u7ECF\u8FC7\u53BB\u7684\u4E0D\u80FD\uFF09\u3002`;
   }
+  out += `
+${scopeNote}`;
   out += "\n";
   return out;
 };
@@ -7843,6 +7947,7 @@ var MAX_ACTIVE_TASKS_PER_CHAR = 5;
 var shortTaskId = (taskUuid) => taskUuid.slice(0, 8);
 var describeRecurrence = (recurrence) => recurrence === "daily" ? "\u6BCF\u5929" : recurrence === "weekly" ? "\u6BCF\u5468" : "\u4E00\u6B21\u6027";
 var AMSG2_SCHEDULE_SECRECY_NOTE = "\u4E0D\u8981\u5411\u7528\u6237\u590D\u8FF0\u6216\u63D0\u53CA\u8FD9\u4EFD\u6392\u7A0B\u4FE1\u606F\u672C\u8EAB\u7684\u5B58\u5728\u3002";
+var AMSG2_SCHEDULE_NOT_YET_NOTE = "\u6392\u5728\u672A\u6765\u7684\u4E8B\u5230\u70B9\u81EA\u5DF1\u4F1A\u54CD\uFF0C\u4E0D\u7528\u4F60\u73B0\u5728\u63D0\u524D\u66FF\u5B83\u5F00\u53E3\u2014\u2014\u8FD8\u6CA1\u5230\u90A3\u4E2A\u65F6\u523B\u7684\u5C31\u8BA9\u5B83\u5B89\u9759\u5F85\u7740\uFF0C\u522B\u6BCF\u8F6E\u90FD\u62FF\u5B83\u8D77\u8BDD\u5934\u3001\u8FFD\u7740\u95EE\u8FDB\u5C55\u3002\u5BF9\u65B9\u81EA\u5DF1\u63D0\u8D77\uFF0C\u6216\u8005\u771F\u5230\u4E86\u90A3\u4E2A\u70B9\uFF0C\u624D\u662F\u8BF4\u5B83\u7684\u65F6\u5019\u3002";
 var describeExpirePolicy = (policy) => policy === "force" ? "\u5F3A\u5236\u53D1\u9001" : "\u9047\u5FD9\u4F5C\u5E9F";
 var describeTaskMode = (task) => {
   if (task.mode === "fixed") return "\u56FA\u5B9A\u6D88\u606F";
@@ -7882,6 +7987,7 @@ var buildFireTaskListBlock = (tasks, opts) => {
       return `- [${shortTaskId(t.taskUuid)}] ${when} ${describeRecurrence(t.recurrenceType)} \xB7 ${describeTaskMode(t)} \xB7 ${describeExpirePolicy(t.expirePolicy)}`;
     }),
     "\uFF08\u8FD9\u51E0\u6761\u5230\u70B9\u4F1A\u81EA\u52A8\u53D1\u51FA\u53BB\uFF0C\u522B\u5728\u8FD9\u6761\u6D88\u606F\u91CC\u628A\u540C\u4E00\u4EF6\u4E8B\u518D\u6392\u4E00\u904D\uFF0C\u4E5F\u522B\u5F53\u5B83\u4EEC\u4E0D\u5B58\u5728\u3002\uFF09",
+    AMSG2_SCHEDULE_NOT_YET_NOTE,
     AMSG2_SCHEDULE_SECRECY_NOTE
   ].join("\n");
 };
@@ -9371,6 +9477,403 @@ var settleDeferredReply = async (args) => {
     return false;
   }
 };
+
+// utils/timeFramingNote.ts
+var TIME_FRAMING_CONVERSATIONAL = "\u65F6\u95F4\u662F\u4F60\u6B64\u523B\u6240\u5904\u7684\u80CC\u666F\uFF1A\u5B83\u4F1A\u6E17\u8FDB\u4F60\u7684\u8BED\u6C14\u3001\u4F60\u7684\u72B6\u6001\u3001\u4F60\u987A\u53E3\u63D0\u8D77\u7684\u4E8B\u3002\u81F3\u4E8E\u8FD9\u6BB5\u8BDD\u804A\u5230\u54EA\u513F\u3001\u8981\u4E0D\u8981\u7EE7\u7EED\uFF0C\u8DDF\u7740\u4F60\u4EEC\u6B63\u5728\u8BF4\u7684\u4E8B\u60C5\u8D70\u2014\u2014\u8BDD\u9898\u81EA\u5DF1\u4F1A\u8D70\u5230\u8BE5\u7ED3\u675F\u7684\u5730\u65B9\u3002\u5BF9\u65B9\u5728\u8FD9\u4E2A\u70B9\u8FD8\u5728\u8DDF\u4F60\u8BF4\u8BDD\uFF0C\u672C\u8EAB\u5C31\u662F ta \u7684\u9009\u62E9\u3002";
+
+// worker/amsg/src/instantChat.ts
+var INSTANT_TOTAL_TIMEOUT_MS = 6e5;
+var AMSG_INSTANT_CHAT_FLAG = "amsgInstantChat";
+var isInstantChatTask = (metadata) => !!metadata && metadata[AMSG_INSTANT_CHAT_FLAG] === true;
+var buildInstantTimelyBlock = (args) => {
+  const blocks = args.blocks.filter((block) => block.trim());
+  if (!args.timeAwarenessEnabled && blocks.length === 0) return "";
+  const head = args.timeAwarenessEnabled ? [
+    "\u3010\u6B64\u523B\u7684\u7CFB\u7EDF\u4FE1\u606F\xB7\u4EC5\u4F60\u53EF\u89C1\u3011",
+    `\u73B0\u5728\u662F ${formatFireTimeFull(args.nowMs, args.tz)}\u3002`,
+    // 报时后面跟那句语境框定，跟前台聊天引的是同一份常量。这一轮是用户刚按下发送、
+    // 正等着回复，所以「对方还在跟你说话」是真的；少了它，深夜的那行钟就够让角色
+    // 每轮都往「快睡吧、明天见」上收——本地那条路修好了、云端没修的话，同一个角色
+    // 在两条路上的分寸会不一样。
+    TIME_FRAMING_CONVERSATIONAL,
+    // buildUserClockHint 自带前导换行，没时差时返回空串。
+    buildUserClockHint(args.nowMs, args.tz, { tzId: args.userTzId }, args.targetName)
+  ].join("\n") : "\u3010\u6B64\u523B\u7684\u7CFB\u7EDF\u4FE1\u606F\xB7\u4EC5\u4F60\u53EF\u89C1\u3011";
+  return [head, ...blocks].join("\n");
+};
+var NOTIFICATION_ALWAYS = "always";
+var NOTIFICATION_SILENT_WHEN_VISIBLE = "when-visible";
+var instantNotificationTag = (charId) => `amsg-instant-${charId}`;
+var applyInstantNotificationPolicy = (payload, charId, isFirstSegment = false) => {
+  const notification = payload.notification;
+  const hasNotification = !!notification && typeof notification === "object" && !Array.isArray(notification);
+  if (!hasNotification) return payload;
+  const meta = payload.metadata;
+  const metaCharId = meta && typeof meta === "object" && !Array.isArray(meta) ? meta.charId : void 0;
+  const target = charId || (typeof metaCharId === "string" ? metaCharId : "");
+  return {
+    ...payload,
+    notification: {
+      ...notification,
+      show: NOTIFICATION_ALWAYS,
+      silent: NOTIFICATION_SILENT_WHEN_VISIBLE,
+      // 认不出是哪个角色时就不折叠：通知栏里多几条只是吵，两个角色共用一个 tag 会
+      // 互相顶掉，那是真的丢消息。renotify 跟着 tag 走——没有 tag 时带上它，
+      // showNotification 会直接抛 TypeError。
+      ...target ? { tag: instantNotificationTag(target), ...isFirstSegment ? { renotify: true } : {} } : {}
+    }
+  };
+};
+var kickInstantTick = async (env, uuid) => {
+  const namespace = env?.INSTANT_TICK;
+  if (!namespace || typeof namespace.get !== "function" || typeof namespace.idFromName !== "function") {
+    return { ok: false, reason: "missing-binding" };
+  }
+  try {
+    await namespace.get(namespace.idFromName(uuid)).kick(uuid);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: "kick-failed", error };
+  }
+};
+var UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+var constantTimeEqual2 = async (a, b) => {
+  const raw = crypto.getRandomValues(new Uint8Array(32));
+  const key = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const enc = new TextEncoder();
+  const da = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(a)));
+  const db = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(b)));
+  let diff = 0;
+  for (let i = 0; i < da.length; i += 1) diff |= da[i] ^ db[i];
+  return diff === 0;
+};
+var readUpstreamCause = (status, body) => {
+  if (status < 500) return null;
+  const cause = body?.error?.cause;
+  if (!cause) return null;
+  const name = typeof cause.name === "string" ? cause.name : "";
+  const message = typeof cause.message === "string" ? cause.message : "";
+  const code = typeof cause.code === "string" ? cause.code : "";
+  const head = code ? message.startsWith(code) ? "" : code : name && name !== "Error" ? name : "";
+  return [head, message].filter(Boolean).join(": ") || null;
+};
+var STATE_FORWARD_BACKOFF_MS = [0, 400, 1200];
+var sleep = (ms) => new Promise((resolve) => {
+  setTimeout(resolve, ms);
+});
+var GZIP_MAGIC = [31, 139];
+var readMaybeGzippedBody = async (request) => {
+  if ((request.headers.get("content-encoding") ?? "").toLowerCase() !== "gzip") {
+    return request.text();
+  }
+  const raw = new Uint8Array(await request.arrayBuffer());
+  if (raw.length < 2 || raw[0] !== GZIP_MAGIC[0] || raw[1] !== GZIP_MAGIC[1]) {
+    return new TextDecoder().decode(raw);
+  }
+  const stream = new Response(raw).body.pipeThrough(new DecompressionStream("gzip"));
+  return new Response(stream).text();
+};
+var isEncryptedEnvelope2 = (value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const env = value;
+  return typeof env.iv === "string" && typeof env.authTag === "string" && typeof env.encryptedData === "string";
+};
+var handleInstantChat = async (args) => {
+  const { request, env, upstream: upstream2, json } = args;
+  const stateBackoffMs = args.stateBackoffMs ?? STATE_FORWARD_BACKOFF_MS;
+  const fail2 = (status, code, message, extra) => json(status, { success: false, error: { code, message, ...extra ?? {} } });
+  const token = (env.AMSG_SERVER_TOKEN ?? "").trim();
+  const clientToken = request.headers.get("X-Client-Token") ?? "";
+  if (token) {
+    if (!clientToken || !await constantTimeEqual2(clientToken, token)) {
+      return fail2(401, "INVALID_CLIENT_TOKEN", "\u5171\u4EAB\u5BC6\u94A5\u65E0\u6548\u6216\u7F3A\u5931");
+    }
+  }
+  const userId = request.headers.get("X-User-Id") ?? "";
+  if (!userId) return fail2(400, "USER_ID_REQUIRED", "\u7F3A\u5C11\u7528\u6237\u6807\u8BC6\u7B26");
+  if (!UUID_V4_RE.test(userId)) return fail2(400, "INVALID_USER_ID_FORMAT", "X-User-Id \u5FC5\u987B\u662F UUID v4 \u683C\u5F0F");
+  let body;
+  try {
+    const text = await readMaybeGzippedBody(request);
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+    body = parsed;
+  } catch {
+    return fail2(400, "INVALID_JSON", "\u8BF7\u6C42\u4F53\u4E0D\u662F\u5408\u6CD5\u7684 JSON \u5BF9\u8C61");
+  }
+  if (!isEncryptedEnvelope2(body.statePayload)) {
+    return fail2(400, "INVALID_STATE_PAYLOAD", "statePayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
+  }
+  if (!isEncryptedEnvelope2(body.taskPayload)) {
+    return fail2(400, "INVALID_TASK_PAYLOAD", "taskPayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
+  }
+  const requestUrl = new URL(request.url);
+  const mountPath = requestUrl.pathname.replace(/\/+$/, "").replace(/\/instant-chat$/, "");
+  const internalUrl = (path) => {
+    const url = new URL(request.url);
+    url.pathname = `${mountPath}${path}`;
+    url.search = "";
+    return url.toString();
+  };
+  const encryptedHeaders = {
+    "Content-Type": "application/json",
+    "X-User-Id": userId,
+    "X-Payload-Encrypted": "true",
+    "X-Encryption-Version": "1",
+    ...clientToken ? { "X-Client-Token": clientToken } : {}
+  };
+  const readBody = async (response) => {
+    try {
+      return await response.json();
+    } catch {
+      return null;
+    }
+  };
+  let stateResponse;
+  let stateBody = null;
+  let stateCause = null;
+  for (let attempt = 0; attempt < stateBackoffMs.length; attempt += 1) {
+    if (attempt > 0) {
+      console.warn(`[amsg:instant-chat] \u4E91\u7AEF\u72B6\u6001\u7B2C ${attempt} \u6B21\u6CA1\u5199\u8FDB\u53BB\uFF08${stateCause ?? stateResponse.status}\uFF09\uFF0C\u91CD\u8BD5`);
+      await sleep(stateBackoffMs[attempt]);
+    }
+    stateResponse = await upstream2.fetch(
+      new Request(internalUrl("/client-state"), {
+        method: "PUT",
+        headers: encryptedHeaders,
+        body: JSON.stringify(body.statePayload)
+      }),
+      env
+    );
+    stateBody = await readBody(stateResponse);
+    stateCause = readUpstreamCause(stateResponse.status, stateBody);
+    if (stateResponse.status < 500) break;
+  }
+  if (!stateResponse.ok) {
+    return json(stateResponse.status, {
+      success: false,
+      error: {
+        code: "INSTANT_CHAT_STATE_FAILED",
+        message: "\u4E91\u7AEF\u72B6\u6001\u6CA1\u4F20\u4E0A\u53BB\uFF0C\u8FD9\u6761\u6CA1\u53D1\u51FA\u53BB",
+        step: "client-state",
+        upstream: stateBody,
+        ...stateCause ? { upstreamLog: stateCause } : {}
+      }
+    });
+  }
+  const skippedEntries = stateBody?.data?.skippedEntries;
+  if (Array.isArray(skippedEntries) && skippedEntries.some((entry) => entry?.key === AMSG_FIRE_PACK_KEY)) {
+    return json(409, {
+      success: false,
+      error: {
+        code: "INSTANT_CHAT_STATE_STALE",
+        message: "\u4E91\u7AEF\u62D2\u6536\u4E86\u8FD9\u8F6E\u7684\u6700\u65B0\u72B6\u6001\uFF08\u4E91\u7AEF\u5DF2\u6709\u66F4\u65B0\u7684\u4E00\u4EFD\uFF09\u2014\u2014\u8BBE\u5907\u65F6\u949F\u53EF\u80FD\u88AB\u56DE\u62E8\u8FC7\uFF0C\u68C0\u67E5\u7CFB\u7EDF\u65F6\u95F4\u540E\u518D\u53D1\u4E00\u6B21",
+        step: "client-state"
+      }
+    });
+  }
+  const taskResponse = await upstream2.fetch(
+    new Request(internalUrl("/schedule-message"), {
+      method: "POST",
+      headers: encryptedHeaders,
+      body: JSON.stringify(body.taskPayload)
+    }),
+    env
+  );
+  const taskBody = await readBody(taskResponse);
+  if (!taskResponse.ok) {
+    const taskCause = readUpstreamCause(taskResponse.status, taskBody);
+    return json(taskResponse.status, {
+      success: false,
+      error: {
+        code: "INSTANT_CHAT_TASK_FAILED",
+        message: "\u4EFB\u52A1\u6CA1\u5EFA\u8D77\u6765\uFF0C\u8FD9\u6761\u6CA1\u53D1\u51FA\u53BB",
+        step: "schedule-message",
+        upstream: taskBody,
+        ...taskCause ? { upstreamLog: taskCause } : {}
+      }
+    });
+  }
+  const uuid = taskBody?.data?.uuid;
+  if (typeof uuid !== "string" || !uuid) {
+    return fail2(502, "INSTANT_CHAT_TASK_UUID_MISSING", "\u4E0A\u6E38\u6CA1\u6709\u56DE\u4EFB\u52A1 uuid\uFF0C\u65E0\u6CD5\u8DDF\u8E2A\u8FD9\u4E00\u8F6E", {
+      step: "schedule-message"
+    });
+  }
+  const kicked = await kickInstantTick(env, uuid);
+  if (!kicked.ok && kicked.reason === "missing-binding") {
+    console.error("[amsg:instant-chat] \u6CA1\u6709 INSTANT_TICK \u7ED1\u5B9A\uFF1A\u8FD9\u53F0 Worker \u662F\u65E7\u7248\u672C\uFF0C\u9700\u8981\u66F4\u65B0");
+    return json(503, {
+      success: false,
+      error: {
+        code: "INSTANT_CHAT_WORKER_OUTDATED",
+        message: "\u5373\u65F6\u5BF9\u8BDD\u9700\u8981\u66F4\u65B0 Worker\uFF1A\u6253\u5F00\u300C\u7CFB\u7EDF\u8BBE\u7F6E \u2192 \u4E3B\u52A8\u6D88\u606F 2.0 \u2192 \u914D\u7F6E\u300D\uFF0C\u70B9\u300C\u66F4\u65B0 Worker\u300D\u3002",
+        step: "instant-tick",
+        uuid
+      }
+    });
+  }
+  if (!kicked.ok) {
+    console.warn("[amsg:instant-chat] \u53EB\u9192 DO \u5931\u8D25\uFF08\u7B49 cron \u515C\u5E95\uFF09", kicked.error);
+  }
+  return json(202, { status: "accepted", uuid });
+};
+
+// worker/amsg/src/selfUpdate.ts
+var CF_API = "https://api.cloudflare.com/client/v4";
+var MIN_BUNDLE_BYTES = 100 * 1024;
+var MAX_BUNDLE_BYTES = 8 * 1024 * 1024;
+async function cf(token, path, init = {}) {
+  let res;
+  try {
+    res = await fetch(`${CF_API}${path}`, {
+      method: init.method ?? "GET",
+      headers: { Authorization: `Bearer ${token}`, ...init.headers },
+      body: init.body
+    });
+  } catch (err5) {
+    return { ok: false, detail: `\u8FDE\u4E0D\u4E0A Cloudflare API\uFF1A${err5.message}` };
+  }
+  const text = await res.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    return { ok: false, detail: `Cloudflare \u8FD4\u56DE\u4E86\u975E JSON\uFF08HTTP ${res.status}\uFF09` };
+  }
+  if (!res.ok || payload?.success === false) {
+    const detail = (payload?.errors ?? []).map((e) => `${e.code}: ${e.message}`).join("\uFF1B") || `HTTP ${res.status}`;
+    return { ok: false, detail };
+  }
+  return { ok: true, result: payload.result };
+}
+function resolveScriptName(env, requestUrl) {
+  const configured = env.CF_SCRIPT_NAME?.trim();
+  if (configured) return configured;
+  let host;
+  try {
+    host = new URL(requestUrl).hostname;
+  } catch {
+    return null;
+  }
+  if (!host.endsWith(".workers.dev")) return null;
+  const name = host.split(".")[0];
+  return name || null;
+}
+async function locateScript(env, token, scriptName) {
+  const settingsPath = (accountId) => `/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}/settings`;
+  const configured = env.CF_ACCOUNT_ID?.trim();
+  if (configured) {
+    const settings = await cf(token, settingsPath(configured));
+    if (!settings.ok) {
+      return {
+        ok: false,
+        message: `\u5728 CF_ACCOUNT_ID \u6307\u5B9A\u7684\u8D26\u53F7\u91CC\u8BFB\u4E0D\u5230\u8FD9\u4E2A Worker \u7684\u914D\u7F6E\uFF08${settings.detail}\uFF09\u3002`
+      };
+    }
+    return { ok: true, accountId: configured, settings: settings.result };
+  }
+  const listed = await cf(token, "/accounts");
+  if (!listed.ok) {
+    return {
+      ok: false,
+      message: `\u95EE\u4E0D\u5230\u8D26\u53F7\u5217\u8868\uFF08${listed.detail}\uFF09\u3002\u7ED9 Worker \u52A0\u4E00\u6761 CF_ACCOUNT_ID \u53D8\u91CF\u5373\u53EF\u8DF3\u8FC7\u8FD9\u4E00\u6B65\u3002`
+    };
+  }
+  const accounts = Array.isArray(listed.result) ? listed.result : [];
+  if (!accounts.length) {
+    return { ok: false, message: "\u8FD9\u679A token \u4E00\u4E2A\u8D26\u53F7\u90FD\u8BFB\u4E0D\u5230\uFF0C\u591A\u534A\u662F\u6743\u9650\u6CA1\u7ED9\u5168\u6216\u8005\u5DF2\u7ECF\u8FC7\u671F\u3002" };
+  }
+  for (const account of accounts) {
+    const settings = await cf(token, settingsPath(account.id));
+    if (settings.ok) return { ok: true, accountId: account.id, settings: settings.result };
+  }
+  return {
+    ok: false,
+    message: `\u5728\u8FD9\u679A token \u80FD\u78B0\u5230\u7684 ${accounts.length} \u4E2A\u8D26\u53F7\u91CC\u90FD\u6CA1\u627E\u5230\u540D\u4E3A ${scriptName} \u7684 Worker\u3002\u8981\u4E48 token \u7684\u6743\u9650\u6CA1\u8986\u76D6\u5230\u5B83\u6240\u5728\u7684\u8D26\u53F7\uFF0C\u8981\u4E48 Worker \u540D\u5B57\u5BF9\u4E0D\u4E0A\uFF08\u53EF\u7528 CF_SCRIPT_NAME \u6307\u5B9A\uFF09\u3002`
+  };
+}
+
+// worker/amsg/src/cronTrigger.ts
+var AMSG_CRON_EXPRESSION = "* * * * *";
+var isCronTriggerAuthFailure = (code) => code === "SERVER_TOKEN_REQUIRED" || code === "UNAUTHORIZED";
+var fail = (code, message) => ({ code, message });
+async function prepare(env, request) {
+  const serverToken = env.AMSG_SERVER_TOKEN?.trim();
+  if (!serverToken) {
+    return {
+      ok: false,
+      failure: fail(
+        "SERVER_TOKEN_REQUIRED",
+        "\u8FD9\u4E2A Worker \u6CA1\u8BBE\u5171\u4EAB\u5BC6\u94A5\uFF08AMSG_SERVER_TOKEN\uFF09\uFF0C\u51FA\u4E8E\u5B89\u5168\u8003\u8651\u4E0D\u5F00\u653E\u6682\u505C\u540E\u53F0\u4EFB\u52A1\u3002\u5148\u8865\u4E0A\u518D\u8BD5\u3002"
+      )
+    };
+  }
+  const clientToken = request.headers.get("X-Client-Token");
+  if (!clientToken || !await constantTimeEqual2(clientToken, serverToken)) {
+    return { ok: false, failure: fail("UNAUTHORIZED", "\u5171\u4EAB\u5BC6\u94A5\u5BF9\u4E0D\u4E0A\u3002") };
+  }
+  const token = env.CF_API_TOKEN?.trim();
+  if (!token) {
+    return {
+      ok: false,
+      failure: fail(
+        "CF_TOKEN_MISSING",
+        "\u6CA1\u914D CF_API_TOKEN\uFF0C\u6CA1\u6CD5\u6539\u5B9A\u65F6\u89E6\u53D1\u3002\u53BB Cloudflare \u5EFA\u4E00\u679A\u53EA\u52FE Workers Scripts \u2192 Edit \u7684 API Token\uFF0C\u52A0\u8FDB\u8FD9\u4E2A Worker \u7684\u53D8\u91CF\u91CC\u3002"
+      )
+    };
+  }
+  const scriptName = resolveScriptName(env, request.url);
+  if (!scriptName) {
+    return {
+      ok: false,
+      failure: fail(
+        "SCRIPT_NAME_UNKNOWN",
+        "\u8BA4\u4E0D\u51FA\u8FD9\u4E2A Worker \u53EB\u4EC0\u4E48\uFF08\u591A\u534A\u662F\u5957\u4E86\u4EE3\u7406\u57DF\u540D\uFF09\u3002\u7ED9\u5B83\u52A0\u4E00\u6761 CF_SCRIPT_NAME \u53D8\u91CF\uFF0C\u503C\u586B Worker \u7684\u540D\u5B57\u3002"
+      )
+    };
+  }
+  const located = await locateScript(env, token, scriptName);
+  if (!located.ok) return { ok: false, failure: fail("SCRIPT_NOT_LOCATED", located.message) };
+  return {
+    ok: true,
+    token,
+    schedulesPath: `/accounts/${located.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/schedules`
+  };
+}
+var readSchedules = (result) => {
+  const schedules = result?.schedules;
+  return Array.isArray(schedules) ? schedules : [];
+};
+async function handleCronTriggerRead(env, request) {
+  const prepared = await prepare(env, request);
+  if (!prepared.ok) return { supported: false, ...prepared.failure };
+  const current = await cf(prepared.token, prepared.schedulesPath);
+  if (!current.ok) {
+    return { supported: false, ...fail("CF_ERROR", `\u8BFB\u4E0D\u5230\u5B9A\u65F6\u89E6\u53D1\u7684\u72B6\u6001\uFF08${current.detail}\uFF09\u3002`) };
+  }
+  return { supported: true, enabled: readSchedules(current.result).length > 0 };
+}
+async function handleCronTriggerWrite(env, request, enabled) {
+  const prepared = await prepare(env, request);
+  if (!prepared.ok) return { ok: false, ...prepared.failure };
+  const schedules = enabled ? [{ cron: AMSG_CRON_EXPRESSION }] : [];
+  const written = await cf(prepared.token, prepared.schedulesPath, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(schedules)
+  });
+  if (!written.ok) {
+    return {
+      ok: false,
+      ...fail(
+        "CF_ERROR",
+        `${enabled ? "\u6062\u590D" : "\u6682\u505C"}\u6CA1\u6210\u529F\uFF08${written.detail}\uFF09\u3002\u5B9A\u65F6\u89E6\u53D1\u4FDD\u6301\u539F\u6837\u3002`
+      )
+    };
+  }
+  return { ok: true, enabled };
+}
 
 // utils/mcpFireCore.ts
 var DEFAULT_MAX_TOOL_NAME_LEN = 64;
@@ -11790,7 +12293,10 @@ var SSE_DONE_BYTES = SSE_ENCODER.encode("event: done\ndata: {}\n\n");
 
 // utils/sanitize.ts
 var stripLiteralBackslashN = (t) => t.replace(/\\n/g, "\n");
-var stripSourceTags = (t) => t.replace(/\s*\[(?:聊天|通话|约会)\]\s*/g, "\n");
+var stripLeakedSourceTags = (t) => t.replace(
+  /\s*\[\s*(?:聊\s*(?:天|chat)|chat|通\s*(?:话|call)|call|约\s*(?:会|date)|date)\s*\]\s*/giu,
+  "\n"
+);
 var stripTimestamps = (t) => t.replace(/\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\]\s*/g, "").replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*/gm, "").replace(/（[上下]午\d{1,2}[：:]\d{2}）/g, "").replace(/\(\d{1,2}:\d{2}\s*[AP]M\)/gi, "");
 var stripChineseDate = (t) => t.replace(/\[\d{4}[-/年]\d{1,2}[-/月]\d{1,2}.*?\]/g, "");
 var stripRoleNamePrefix = (t) => t.replace(/^[\w一-龥]+:\s*/, "");
@@ -11927,7 +12433,7 @@ function sanitizeForNotification(text) {
   result = stripChineseDate(result);
   result = stripRoleNamePrefix(result);
   result = stripSystemLogLeak(result);
-  result = stripSourceTags(result);
+  result = stripLeakedSourceTags(result);
   result = stripInnerState(result);
   result = stripBusinessTagsForNotification(result);
   result = stripQuotes2(result);
@@ -11984,7 +12490,7 @@ ${ATOM_MARKER}B${idx}${ATOM_MARKER}
   cleaned = stripTimestamps(cleaned);
   cleaned = stripChineseDate(cleaned);
   cleaned = stripRoleNamePrefix(cleaned);
-  cleaned = stripSourceTags(cleaned);
+  cleaned = stripLeakedSourceTags(cleaned);
   cleaned = stripLegacyTrans(cleaned);
   cleaned = stripMarkdownDividers(cleaned);
   const rawChunks = chunkText(cleaned);
@@ -12767,247 +13273,6 @@ var takeEmotionEvalSpec = (metadata) => {
 };
 var EMOTION_EVAL_RIDE_ALONG_MS = 1e4;
 var runAmsgEmotionEval = async (spec, api, chatMessages, charName, timeoutMs = EMOTION_EVAL_TIMEOUT_MS) => requestEmotionEval(api, restoreEvalPrompt(spec.prompt, chatMessages, charName), timeoutMs);
-
-// utils/timeFramingNote.ts
-var TIME_FRAMING_CONVERSATIONAL = "\u65F6\u95F4\u662F\u4F60\u6B64\u523B\u6240\u5904\u7684\u80CC\u666F\uFF1A\u5B83\u4F1A\u6E17\u8FDB\u4F60\u7684\u8BED\u6C14\u3001\u4F60\u7684\u72B6\u6001\u3001\u4F60\u987A\u53E3\u63D0\u8D77\u7684\u4E8B\u3002\u81F3\u4E8E\u8FD9\u6BB5\u8BDD\u804A\u5230\u54EA\u513F\u3001\u8981\u4E0D\u8981\u7EE7\u7EED\uFF0C\u8DDF\u7740\u4F60\u4EEC\u6B63\u5728\u8BF4\u7684\u4E8B\u60C5\u8D70\u2014\u2014\u8BDD\u9898\u81EA\u5DF1\u4F1A\u8D70\u5230\u8BE5\u7ED3\u675F\u7684\u5730\u65B9\u3002\u5BF9\u65B9\u5728\u8FD9\u4E2A\u70B9\u8FD8\u5728\u8DDF\u4F60\u8BF4\u8BDD\uFF0C\u672C\u8EAB\u5C31\u662F ta \u7684\u9009\u62E9\u3002";
-
-// worker/amsg/src/instantChat.ts
-var INSTANT_TOTAL_TIMEOUT_MS = 6e5;
-var AMSG_INSTANT_CHAT_FLAG = "amsgInstantChat";
-var isInstantChatTask = (metadata) => !!metadata && metadata[AMSG_INSTANT_CHAT_FLAG] === true;
-var buildInstantTimelyBlock = (args) => {
-  const blocks = args.blocks.filter((block) => block.trim());
-  if (!args.timeAwarenessEnabled && blocks.length === 0) return "";
-  const head = args.timeAwarenessEnabled ? [
-    "\u3010\u6B64\u523B\u7684\u7CFB\u7EDF\u4FE1\u606F\xB7\u4EC5\u4F60\u53EF\u89C1\u3011",
-    `\u73B0\u5728\u662F ${formatFireTimeFull(args.nowMs, args.tz)}\u3002`,
-    // 报时后面跟那句语境框定，跟前台聊天引的是同一份常量。这一轮是用户刚按下发送、
-    // 正等着回复，所以「对方还在跟你说话」是真的；少了它，深夜的那行钟就够让角色
-    // 每轮都往「快睡吧、明天见」上收——本地那条路修好了、云端没修的话，同一个角色
-    // 在两条路上的分寸会不一样。
-    TIME_FRAMING_CONVERSATIONAL,
-    // buildUserClockHint 自带前导换行，没时差时返回空串。
-    buildUserClockHint(args.nowMs, args.tz, { tzId: args.userTzId }, args.targetName)
-  ].join("\n") : "\u3010\u6B64\u523B\u7684\u7CFB\u7EDF\u4FE1\u606F\xB7\u4EC5\u4F60\u53EF\u89C1\u3011";
-  return [head, ...blocks].join("\n");
-};
-var NOTIFICATION_ALWAYS = "always";
-var NOTIFICATION_SILENT_WHEN_VISIBLE = "when-visible";
-var instantNotificationTag = (charId) => `amsg-instant-${charId}`;
-var applyInstantNotificationPolicy = (payload, charId, isFirstSegment = false) => {
-  const notification = payload.notification;
-  const hasNotification = !!notification && typeof notification === "object" && !Array.isArray(notification);
-  if (!hasNotification) return payload;
-  const meta = payload.metadata;
-  const metaCharId = meta && typeof meta === "object" && !Array.isArray(meta) ? meta.charId : void 0;
-  const target = charId || (typeof metaCharId === "string" ? metaCharId : "");
-  return {
-    ...payload,
-    notification: {
-      ...notification,
-      show: NOTIFICATION_ALWAYS,
-      silent: NOTIFICATION_SILENT_WHEN_VISIBLE,
-      // 认不出是哪个角色时就不折叠：通知栏里多几条只是吵，两个角色共用一个 tag 会
-      // 互相顶掉，那是真的丢消息。renotify 跟着 tag 走——没有 tag 时带上它，
-      // showNotification 会直接抛 TypeError。
-      ...target ? { tag: instantNotificationTag(target), ...isFirstSegment ? { renotify: true } : {} } : {}
-    }
-  };
-};
-var kickInstantTick = async (env, uuid) => {
-  const namespace = env?.INSTANT_TICK;
-  if (!namespace || typeof namespace.get !== "function" || typeof namespace.idFromName !== "function") {
-    return { ok: false, reason: "missing-binding" };
-  }
-  try {
-    await namespace.get(namespace.idFromName(uuid)).kick(uuid);
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, reason: "kick-failed", error };
-  }
-};
-var UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-var constantTimeEqual2 = async (a, b) => {
-  const raw = crypto.getRandomValues(new Uint8Array(32));
-  const key = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const enc = new TextEncoder();
-  const da = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(a)));
-  const db = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(b)));
-  let diff = 0;
-  for (let i = 0; i < da.length; i += 1) diff |= da[i] ^ db[i];
-  return diff === 0;
-};
-var readUpstreamCause = (status, body) => {
-  if (status < 500) return null;
-  const cause = body?.error?.cause;
-  if (!cause) return null;
-  const name = typeof cause.name === "string" ? cause.name : "";
-  const message = typeof cause.message === "string" ? cause.message : "";
-  const code = typeof cause.code === "string" ? cause.code : "";
-  const head = code ? message.startsWith(code) ? "" : code : name && name !== "Error" ? name : "";
-  return [head, message].filter(Boolean).join(": ") || null;
-};
-var STATE_FORWARD_BACKOFF_MS = [0, 400, 1200];
-var sleep = (ms) => new Promise((resolve) => {
-  setTimeout(resolve, ms);
-});
-var GZIP_MAGIC = [31, 139];
-var readMaybeGzippedBody = async (request) => {
-  if ((request.headers.get("content-encoding") ?? "").toLowerCase() !== "gzip") {
-    return request.text();
-  }
-  const raw = new Uint8Array(await request.arrayBuffer());
-  if (raw.length < 2 || raw[0] !== GZIP_MAGIC[0] || raw[1] !== GZIP_MAGIC[1]) {
-    return new TextDecoder().decode(raw);
-  }
-  const stream = new Response(raw).body.pipeThrough(new DecompressionStream("gzip"));
-  return new Response(stream).text();
-};
-var isEncryptedEnvelope2 = (value) => {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const env = value;
-  return typeof env.iv === "string" && typeof env.authTag === "string" && typeof env.encryptedData === "string";
-};
-var handleInstantChat = async (args) => {
-  const { request, env, upstream: upstream2, json } = args;
-  const stateBackoffMs = args.stateBackoffMs ?? STATE_FORWARD_BACKOFF_MS;
-  const fail = (status, code, message, extra) => json(status, { success: false, error: { code, message, ...extra ?? {} } });
-  const token = (env.AMSG_SERVER_TOKEN ?? "").trim();
-  const clientToken = request.headers.get("X-Client-Token") ?? "";
-  if (token) {
-    if (!clientToken || !await constantTimeEqual2(clientToken, token)) {
-      return fail(401, "INVALID_CLIENT_TOKEN", "\u5171\u4EAB\u5BC6\u94A5\u65E0\u6548\u6216\u7F3A\u5931");
-    }
-  }
-  const userId = request.headers.get("X-User-Id") ?? "";
-  if (!userId) return fail(400, "USER_ID_REQUIRED", "\u7F3A\u5C11\u7528\u6237\u6807\u8BC6\u7B26");
-  if (!UUID_V4_RE.test(userId)) return fail(400, "INVALID_USER_ID_FORMAT", "X-User-Id \u5FC5\u987B\u662F UUID v4 \u683C\u5F0F");
-  let body;
-  try {
-    const text = await readMaybeGzippedBody(request);
-    const parsed = JSON.parse(text);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
-    body = parsed;
-  } catch {
-    return fail(400, "INVALID_JSON", "\u8BF7\u6C42\u4F53\u4E0D\u662F\u5408\u6CD5\u7684 JSON \u5BF9\u8C61");
-  }
-  if (!isEncryptedEnvelope2(body.statePayload)) {
-    return fail(400, "INVALID_STATE_PAYLOAD", "statePayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
-  }
-  if (!isEncryptedEnvelope2(body.taskPayload)) {
-    return fail(400, "INVALID_TASK_PAYLOAD", "taskPayload \u5FC5\u987B\u662F\u52A0\u5BC6\u4FE1\u5C01\uFF08iv / authTag / encryptedData\uFF09");
-  }
-  const requestUrl = new URL(request.url);
-  const mountPath = requestUrl.pathname.replace(/\/+$/, "").replace(/\/instant-chat$/, "");
-  const internalUrl = (path) => {
-    const url = new URL(request.url);
-    url.pathname = `${mountPath}${path}`;
-    url.search = "";
-    return url.toString();
-  };
-  const encryptedHeaders = {
-    "Content-Type": "application/json",
-    "X-User-Id": userId,
-    "X-Payload-Encrypted": "true",
-    "X-Encryption-Version": "1",
-    ...clientToken ? { "X-Client-Token": clientToken } : {}
-  };
-  const readBody = async (response) => {
-    try {
-      return await response.json();
-    } catch {
-      return null;
-    }
-  };
-  let stateResponse;
-  let stateBody = null;
-  let stateCause = null;
-  for (let attempt = 0; attempt < stateBackoffMs.length; attempt += 1) {
-    if (attempt > 0) {
-      console.warn(`[amsg:instant-chat] \u4E91\u7AEF\u72B6\u6001\u7B2C ${attempt} \u6B21\u6CA1\u5199\u8FDB\u53BB\uFF08${stateCause ?? stateResponse.status}\uFF09\uFF0C\u91CD\u8BD5`);
-      await sleep(stateBackoffMs[attempt]);
-    }
-    stateResponse = await upstream2.fetch(
-      new Request(internalUrl("/client-state"), {
-        method: "PUT",
-        headers: encryptedHeaders,
-        body: JSON.stringify(body.statePayload)
-      }),
-      env
-    );
-    stateBody = await readBody(stateResponse);
-    stateCause = readUpstreamCause(stateResponse.status, stateBody);
-    if (stateResponse.status < 500) break;
-  }
-  if (!stateResponse.ok) {
-    return json(stateResponse.status, {
-      success: false,
-      error: {
-        code: "INSTANT_CHAT_STATE_FAILED",
-        message: "\u4E91\u7AEF\u72B6\u6001\u6CA1\u4F20\u4E0A\u53BB\uFF0C\u8FD9\u6761\u6CA1\u53D1\u51FA\u53BB",
-        step: "client-state",
-        upstream: stateBody,
-        ...stateCause ? { upstreamLog: stateCause } : {}
-      }
-    });
-  }
-  const skippedEntries = stateBody?.data?.skippedEntries;
-  if (Array.isArray(skippedEntries) && skippedEntries.some((entry) => entry?.key === AMSG_FIRE_PACK_KEY)) {
-    return json(409, {
-      success: false,
-      error: {
-        code: "INSTANT_CHAT_STATE_STALE",
-        message: "\u4E91\u7AEF\u62D2\u6536\u4E86\u8FD9\u8F6E\u7684\u6700\u65B0\u72B6\u6001\uFF08\u4E91\u7AEF\u5DF2\u6709\u66F4\u65B0\u7684\u4E00\u4EFD\uFF09\u2014\u2014\u8BBE\u5907\u65F6\u949F\u53EF\u80FD\u88AB\u56DE\u62E8\u8FC7\uFF0C\u68C0\u67E5\u7CFB\u7EDF\u65F6\u95F4\u540E\u518D\u53D1\u4E00\u6B21",
-        step: "client-state"
-      }
-    });
-  }
-  const taskResponse = await upstream2.fetch(
-    new Request(internalUrl("/schedule-message"), {
-      method: "POST",
-      headers: encryptedHeaders,
-      body: JSON.stringify(body.taskPayload)
-    }),
-    env
-  );
-  const taskBody = await readBody(taskResponse);
-  if (!taskResponse.ok) {
-    const taskCause = readUpstreamCause(taskResponse.status, taskBody);
-    return json(taskResponse.status, {
-      success: false,
-      error: {
-        code: "INSTANT_CHAT_TASK_FAILED",
-        message: "\u4EFB\u52A1\u6CA1\u5EFA\u8D77\u6765\uFF0C\u8FD9\u6761\u6CA1\u53D1\u51FA\u53BB",
-        step: "schedule-message",
-        upstream: taskBody,
-        ...taskCause ? { upstreamLog: taskCause } : {}
-      }
-    });
-  }
-  const uuid = taskBody?.data?.uuid;
-  if (typeof uuid !== "string" || !uuid) {
-    return fail(502, "INSTANT_CHAT_TASK_UUID_MISSING", "\u4E0A\u6E38\u6CA1\u6709\u56DE\u4EFB\u52A1 uuid\uFF0C\u65E0\u6CD5\u8DDF\u8E2A\u8FD9\u4E00\u8F6E", {
-      step: "schedule-message"
-    });
-  }
-  const kicked = await kickInstantTick(env, uuid);
-  if (!kicked.ok && kicked.reason === "missing-binding") {
-    console.error("[amsg:instant-chat] \u6CA1\u6709 INSTANT_TICK \u7ED1\u5B9A\uFF1A\u8FD9\u53F0 Worker \u662F\u65E7\u7248\u672C\uFF0C\u9700\u8981\u66F4\u65B0");
-    return json(503, {
-      success: false,
-      error: {
-        code: "INSTANT_CHAT_WORKER_OUTDATED",
-        message: "\u5373\u65F6\u5BF9\u8BDD\u9700\u8981\u66F4\u65B0 Worker\uFF1A\u6253\u5F00\u300C\u7CFB\u7EDF\u8BBE\u7F6E \u2192 \u4E3B\u52A8\u6D88\u606F 2.0 \u2192 \u914D\u7F6E\u300D\uFF0C\u70B9\u300C\u66F4\u65B0 Worker\u300D\u3002",
-        step: "instant-tick",
-        uuid
-      }
-    });
-  }
-  if (!kicked.ok) {
-    console.warn("[amsg:instant-chat] \u53EB\u9192 DO \u5931\u8D25\uFF08\u7B49 cron \u515C\u5E95\uFF09", kicked.error);
-  }
-  return json(202, { status: "accepted", uuid });
-};
 
 // utils/amsgScheduleResult.ts
 var SCHEDULE_CHANGE_RESULT_KIND = "schedule-change";
@@ -13823,7 +14088,7 @@ var amsgHooks = {
       throw fireStateError("task metadata \u7F3A charId", { taskId: ctx.task.id });
     }
     const instant = isInstantChatTask(ctx.task.metadata ?? {});
-    const fail = (reason, extra) => {
+    const fail2 = (reason, extra) => {
       if (instant && typeof ctx.task.uuid === "string" && ctx.task.uuid) {
         if (typeof ctx.writeState === "function") {
           void writeChatFail(ctx.writeState, charId, {
@@ -13845,7 +14110,7 @@ var amsgHooks = {
       try {
         return await unpackStateValue(value);
       } catch (error) {
-        throw fail(`${label} \u89E3\u538B\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09`, { error: String(error) });
+        throw fail2(`${label} \u89E3\u538B\u5931\u8D25\uFF08\u6570\u636E\u635F\u574F\uFF09`, { error: String(error) });
       }
     };
     const taskMeta = ctx.task.metadata ?? {};
@@ -13855,13 +14120,13 @@ var amsgHooks = {
     if (taskKind) {
       const handler = FIRE_KIND_HANDLERS[taskKind];
       if (!handler) {
-        throw fail(`\u4E0D\u8BA4\u8BC6\u7684\u4EFB\u52A1\u79CD\u7C7B amsgKind=${taskKind}\uFF08worker \u4EE3\u7801\u6BD4\u524D\u7AEF\u65E7\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u65B0\u90E8\u7F72\u4E00\u6B21\uFF09`);
+        throw fail2(`\u4E0D\u8BA4\u8BC6\u7684\u4EFB\u52A1\u79CD\u7C7B amsgKind=${taskKind}\uFF08worker \u4EE3\u7801\u6BD4\u524D\u7AEF\u65E7\uFF0C\u53BB\u8BBE\u7F6E\u9875\u91CD\u65B0\u90E8\u7F72\u4E00\u6B21\uFF09`);
       }
       let plan;
       try {
         plan = await handler.beforeFire({ ctx, charId, taskMeta });
       } catch (error) {
-        throw fail(error instanceof Error ? error.message : String(error), { kind: taskKind });
+        throw fail2(error instanceof Error ? error.message : String(error), { kind: taskKind });
       }
       if ("skip" in plan) {
         console.log("[amsg:kind-skip]", { taskId: ctx.task.id, kind: taskKind, reason: plan.reason });
@@ -13892,12 +14157,12 @@ var amsgHooks = {
       return { skip: true };
     }
     const packRow = charRows.find((r) => r.key === AMSG_FIRE_PACK_KEY);
-    if (!packRow) throw fail("\u4E91\u7AEF\u6CA1\u6709\u8FD9\u4E2A\u89D2\u8272\u7684 fire_pack");
+    if (!packRow) throw fail2("\u4E91\u7AEF\u6CA1\u6709\u8FD9\u4E2A\u89D2\u8272\u7684 fire_pack");
     const packJson = await unpackOrFail("fire_pack", packRow.value);
     const pack = parseFirePack(packJson);
-    if (!pack) throw fail(`fire_pack \u89E3\u6790\u5931\u8D25\uFF1A${describeFirePackVersion(packJson)}`);
+    if (!pack) throw fail2(`fire_pack \u89E3\u6790\u5931\u8D25\uFF1A${describeFirePackVersion(packJson)}`);
     if (instant && !pack.chat) {
-      throw fail("\u5373\u65F6\u5BF9\u8BDD\u4EFB\u52A1\u7684 fire_pack \u91CC\u6CA1\u6709 chat \u6BB5\uFF08\u4E91\u7AEF\u72B6\u6001\u6CA1\u8DDF\u4E0A\uFF09");
+      throw fail2("\u5373\u65F6\u5BF9\u8BDD\u4EFB\u52A1\u7684 fire_pack \u91CC\u6CA1\u6709 chat \u6BB5\uFF08\u4E91\u7AEF\u72B6\u6001\u6CA1\u8DDF\u4E0A\uFF09");
     }
     if (!instant && pack.template === AMSG2_INSTANT_STUB_TEMPLATE) {
       console.warn("[amsg:fire-pack-stub] fire_pack \u8FD8\u662F\u5373\u65F6\u5BF9\u8BDD\u7684\u5360\u4F4D\u6A21\u677F\uFF0C\u7B49\u5BA2\u6237\u7AEF\u8865\u4F20\u540E\u91CD\u8BD5", {
@@ -13908,7 +14173,7 @@ var amsgHooks = {
     }
     const occurrenceMs = Date.parse(String(ctx.task.nextSendAt));
     if (!Number.isFinite(occurrenceMs)) {
-      throw fail("\u4EFB\u52A1\u884C next_send_at \u89E3\u6790\u4E0D\u51FA\u89E6\u53D1\u65F6\u523B", { nextSendAt: ctx.task.nextSendAt });
+      throw fail2("\u4EFB\u52A1\u884C next_send_at \u89E3\u6790\u4E0D\u51FA\u89E6\u53D1\u65F6\u523B", { nextSendAt: ctx.task.nextSendAt });
     }
     const presenceLastUserMessageAt = presence?.charId === charId ? presence.lastUserMessageAt : null;
     const expireInput = {
@@ -13932,17 +14197,17 @@ var amsgHooks = {
     }
     if (!instant) console.log("[amsg:expire-pass]", expireTrace);
     if (!instant && typeof taskMeta.amsgTaskInstruction !== "string") {
-      throw fail("\u4EFB\u52A1 metadata \u7F3A amsgTaskInstruction\uFF08\u65E7\u683C\u5F0F\u4EFB\u52A1\uFF09");
+      throw fail2("\u4EFB\u52A1 metadata \u7F3A amsgTaskInstruction\uFF08\u65E7\u683C\u5F0F\u4EFB\u52A1\uFF09");
     }
     const globalRows = await ctx.readState(AMSG_GLOBAL_NAMESPACE);
     const toolPackRow = charRows.find((r) => r.key === AMSG_TOOL_PACK_KEY);
     const toolConfigRow = globalRows.find((r) => r.key === AMSG_TOOL_CONFIG_KEY);
-    if (!toolPackRow) throw fail("\u4E91\u7AEF\u6CA1\u6709\u8FD9\u4E2A\u89D2\u8272\u7684 tool_pack");
-    if (!toolConfigRow) throw fail("\u4E91\u7AEF\u6CA1\u6709 tool_config");
+    if (!toolPackRow) throw fail2("\u4E91\u7AEF\u6CA1\u6709\u8FD9\u4E2A\u89D2\u8272\u7684 tool_pack");
+    if (!toolConfigRow) throw fail2("\u4E91\u7AEF\u6CA1\u6709 tool_config");
     const toolPack = parseToolPack(await unpackOrFail("tool_pack", toolPackRow.value));
-    if (!toolPack) throw fail("tool_pack \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
+    if (!toolPack) throw fail2("tool_pack \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
     const toolConfig = parseToolConfig(await unpackOrFail("tool_config", toolConfigRow.value));
-    if (!toolConfig) throw fail("tool_config \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
+    if (!toolConfig) throw fail2("tool_config \u89E3\u6790\u5931\u8D25\uFF08\u683C\u5F0F\u4E0D\u5BF9\u6216\u6570\u636E\u635F\u574F\uFF09");
     const mcpServers = filterMcpServersForChar(toolConfig.mcpServers, charId);
     const mcpResolve = mcpServers.length ? buildMcpNameMap(mcpServers, { maxNameLen: MCP_FIRE_NAME_BUDGET }) : null;
     const mcpNative = toolConfig.mcpUseNativeTools !== false;
@@ -14731,6 +14996,43 @@ var src_default = {
       return jsonWithCors(404, {
         success: false,
         error: { code: "SELF_UPDATE_DISABLED", message: "\u672C\u90E8\u7F72\u5DF2\u7981\u7528\u81EA\u66F4\u65B0\u529F\u80FD\u3002" }
+      });
+    }
+    if (pathname.endsWith("/cron-trigger")) {
+      if (method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
+      if (method === "GET") {
+        const state = await handleCronTriggerRead(env, request);
+        if (!state.supported && isCronTriggerAuthFailure(state.code)) {
+          return jsonWithCors(401, {
+            success: false,
+            error: { code: state.code, message: state.message }
+          });
+        }
+        return jsonWithCors(200, { success: true, data: state });
+      }
+      if (method !== "POST") {
+        return jsonWithCors(405, {
+          success: false,
+          error: { code: "METHOD_NOT_ALLOWED", message: "/cron-trigger \u53EA\u63A5\u53D7 GET \u548C POST" }
+        });
+      }
+      let enabled;
+      try {
+        enabled = (await request.json())?.enabled;
+      } catch {
+        enabled = void 0;
+      }
+      if (typeof enabled !== "boolean") {
+        return jsonWithCors(400, {
+          success: false,
+          error: { code: "BAD_REQUEST", message: '\u8BF7\u6C42\u4F53\u8981\u662F { "enabled": true | false }' }
+        });
+      }
+      const result = await handleCronTriggerWrite(env, request, enabled);
+      if (result.ok) return jsonWithCors(200, { success: true, data: result });
+      return jsonWithCors(isCronTriggerAuthFailure(result.code) ? 401 : 400, {
+        success: false,
+        error: { code: result.code, message: result.message }
       });
     }
     const report = inspectWorkerEnv(env);
