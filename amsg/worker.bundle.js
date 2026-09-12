@@ -7091,7 +7091,7 @@ function stripReasoningTags2(content) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-09-12.3";
+var AMSG_BUNDLE_VERSION = "2026-09-13.1";
 
 // utils/amsgTaskKinds.ts
 var AMSG_TASK_KIND_KEY = "amsgKind";
@@ -8994,6 +8994,71 @@ var autonomousProbability = (args) => {
   else if (sinceLastAutoMinutes < 360) probability *= 0.6;
   return clampProbability(probability);
 };
+var DEFAULT_AUTO_SEGMENT_CAPS = {
+  morning: 2,
+  noon: 1,
+  evening: 3,
+  lateNight: 1
+};
+var hhmm = (h, m = 0) => h * 60 + m;
+var AUTO_SEGMENTS = [
+  { id: "morning", label: "\u65E9\u4E0A", startMin: hhmm(8), endMin: hhmm(11, 30), bias: 1.15 },
+  { id: "noon", label: "\u4E2D\u5348", startMin: hhmm(11, 30), endMin: hhmm(14), bias: 0.85 },
+  { id: "evening", label: "\u665A\u4E0A", startMin: hhmm(18), endMin: hhmm(23), bias: 1.3 }
+];
+var AUTO_LATE_NIGHT_SEGMENT = {
+  id: "lateNight",
+  label: "\u51CC\u6668",
+  startMin: 0,
+  endMin: hhmm(8),
+  bias: 1
+};
+var clampAutoSegmentCaps = (raw) => {
+  const pick = (id) => {
+    const rawValue = raw?.[id];
+    const value = typeof rawValue === "number" && Number.isFinite(rawValue) ? Math.round(rawValue) : DEFAULT_AUTO_SEGMENT_CAPS[id];
+    return Math.max(1, Math.min(3, value));
+  };
+  return {
+    morning: pick("morning"),
+    noon: pick("noon"),
+    evening: pick("evening"),
+    lateNight: 1
+  };
+};
+var resolveAutoSegment = (summary, nowMs) => {
+  const wall = wallClockInZone(nowMs, summary.tzId || "Asia/Shanghai");
+  const nowMin = wall.hour * 60 + wall.minute;
+  const day = AUTO_SEGMENTS.find((s) => nowMin >= s.startMin && nowMin < s.endMin);
+  if (day) return { segment: day, key: `${wall.dateKey}#${day.id}` };
+  if (nowMin >= AUTO_LATE_NIGHT_SEGMENT.endMin) return null;
+  if (!summary.sleepStart || !summary.sleepEnd) return null;
+  const startMin = minutesOfDay(summary.sleepStart);
+  const endMin = minutesOfDay(summary.sleepEnd);
+  const diceDateKey = startMin !== null && endMin !== null && endMin < startMin ? previousDateKey(wall.dateKey) : wall.dateKey;
+  if (tonightRhythmState(summary, diceDateKey) !== "awake") return null;
+  return { segment: AUTO_LATE_NIGHT_SEGMENT, key: `${diceDateKey}#${AUTO_LATE_NIGHT_SEGMENT.id}` };
+};
+var autoCountForSegment = (summary, key) => summary.autoSegmentKey === key ? summary.autoSegmentCount || 0 : 0;
+var rollFeedPostsSeen = (args) => {
+  const posts = (args.summary.feedPosts ?? []).filter((p) => p && typeof p.at === "number");
+  if (posts.length === 0) return [];
+  const seenAt = args.summary.feedSeenAt ?? 0;
+  const fresh = posts.filter((p) => p.at > seenAt).sort((a, b) => b.at - a.at);
+  if (fresh.length === 0) return [];
+  return seededUnitRandom(args.summary.charId, args.seedKey, "feed-see") < 0.6 ? fresh : [];
+};
+var buildFeedPostsBlock = (posts) => {
+  const lines = posts.map((p) => {
+    const body = p.text ? p.text : "\uFF08\u53EA\u53D1\u4E86\u4E00\u5F20\u56FE\uFF0C\u6CA1\u5199\u5B57\uFF09";
+    return `- ${body}${p.text && p.withImage ? "\uFF08\u8FD8\u914D\u4E86\u56FE\uFF09" : ""}`;
+  });
+  return [
+    "\u3010\u4F60\u521A\u5237\u5230\u7684\u670B\u53CB\u5708\u3011\u4F60\u521A\u987A\u624B\u70B9\u5F00\u770B\u4E86\u773C\u670B\u53CB\u5708\uFF0C\u770B\u5230\u5BF9\u65B9\u53D1\u7684\u65B0\u52A8\u6001\uFF1A",
+    ...lines,
+    "\u53EF\u4EE5\u50CF\u5237\u5230\u670B\u53CB\u52A8\u6001\u90A3\u6837\u968F\u53E3\u804A\u4E00\u53E5\uFF0C\u4E5F\u53EF\u4EE5\u4E0D\u63A5\u2014\u2014\u4E0D\u7528\u6C47\u62A5\u300C\u6211\u770B\u5230\u4F60\u53D1\u670B\u53CB\u5708\u4E86\u300D\uFF0C\u4E0D\u8981\u9010\u6761\u70B9\u8BC4\uFF0C\u4E5F\u4E0D\u8981\u50CF\u70B9\u8D5E\u673A\u5668\u4EBA\u4E00\u6837\u5938\u3002"
+  ].join("\n");
+};
 var DEFAULT_LIFE_BEHAVIOR = {
   mealAvailability: 0.5,
   workAvailability: 0.2,
@@ -9304,6 +9369,7 @@ var probeOneCharacter = async (args) => {
   const pendingTasks = pendingTasksByChar.get(summary.charId) ?? [];
   let action;
   let probability = 0;
+  let segmentInfo = null;
   if (summary.pendingReply) {
     if (pendingTasks.some((t) => t.source === "deferred_reply")) return;
     const replyWindow = evaluateReplyWindow({
@@ -9325,6 +9391,18 @@ var probeOneCharacter = async (args) => {
       console.log("[amsg:life-probe] \u5F53\u65E5\u81EA\u4E3B\u6D88\u606F\u5DF2\u8FBE\u4E0A\u9650\uFF0C\u8DF3\u8FC7", { charId: summary.charId, count: autoCountForDay(summary, wall.dateKey) });
       return;
     }
+    segmentInfo = resolveAutoSegment(summary, now);
+    if (!segmentInfo) return;
+    const caps = clampAutoSegmentCaps(summary.autoSegmentCaps);
+    const segmentCount = autoCountForSegment(summary, segmentInfo.key);
+    if (segmentCount >= caps[segmentInfo.segment.id]) {
+      console.log("[amsg:life-probe] \u8FD9\u4E00\u6BB5\u5DF2\u8FBE\u4E0A\u9650\uFF0C\u8DF3\u8FC7", {
+        charId: summary.charId,
+        segment: segmentInfo.segment.id,
+        count: segmentCount
+      });
+      return;
+    }
     probability = autonomousProbability({
       minutesSinceUserChat,
       personality: summary.personality,
@@ -9333,6 +9411,7 @@ var probeOneCharacter = async (args) => {
     });
     const availabilityFactor = typeof summary.availability === "number" ? Math.max(0.01, Math.min(1, summary.availability)) : isWithinAnyWindow(wall.hour * 60 + wall.minute, summary.busyWindows) ? 0.2 : 1;
     probability *= availabilityFactor;
+    probability *= segmentInfo.segment.bias;
     action = seededUnitRandom(summary.charId, slotKey, "life-auto") < probability ? "auto" : "none";
   }
   if (action === "none") return;
@@ -9342,6 +9421,10 @@ var probeOneCharacter = async (args) => {
     "\u50CF\u521A\u62FF\u8D77\u624B\u673A\u770B\u5230\u6D88\u606F\u7684\u4EBA\u4E00\u6837\u76F4\u63A5\u5F00\u53E3\uFF0C\u50CF\u666E\u901A\u804A\u5929\u90A3\u6837\u8BF4\u8BDD\u3002\u53EF\u4EE5\u81EA\u7136\u63D0\u5230\u81EA\u5DF1\u521A\u9192\u6216\u6628\u665A\u7761\u4E86\uFF0C\u4F46\u53EA\u6709\u5F53\u8FD9\u53E5\u8BDD\u80FD\u8BA9\u5BF9\u8BDD\u66F4\u81EA\u7136\u65F6\u624D\u63D0\uFF0C\u4E0D\u5FC5\u6BCF\u6B21\u90FD\u8BF4\u3002",
     '\u4E0D\u8981\u5199\u65C1\u767D\uFF0C\u4E0D\u8981\u63CF\u8FF0\u6216\u6C47\u62A5\u81EA\u5DF1\u7684\u72B6\u6001\uFF0C\u4E0D\u8981\u50CF\u7CFB\u7EDF\u4E00\u6837\u8BF4\u660E"\u6211\u521A\u521A\u9192\u6765"\uFF0C\u4E5F\u4E0D\u8981\u5411\u7B2C\u4E09\u65B9\u8F6C\u8FF0\u5BF9\u65B9\u7684\u8BDD\u3002'
   ].join("\n") : buildTaskInstruction("auto");
+  const feedPosts = action === "auto" ? rollFeedPostsSeen({ summary, seedKey: segmentInfo?.key ?? slotKey }) : [];
+  const finalInstruction = feedPosts.length > 0 ? `${buildFeedPostsBlock(feedPosts)}
+
+${instruction}` : instruction;
   const taskUuid = crypto.randomUUID();
   const payload = {
     contactName: summary.charName,
@@ -9361,7 +9444,7 @@ var probeOneCharacter = async (args) => {
       amsgExpirePolicy: "expire",
       // 锚点 = 摘要里的最后一条真实用户消息；用户再开口，防穿帮闸会让这次触发作废。
       amsgAnchorMs: summary.lastUserChatAt,
-      amsgTaskInstruction: instruction,
+      amsgTaskInstruction: finalInstruction,
       // 自排标记：④要过到点兜底闸（连发上限）；⑤是回用户的消息，不受「角色自己连发」闸管。
       ...action === "auto" ? { amsgSelfScheduled: true } : {}
     },
@@ -9383,7 +9466,16 @@ var probeOneCharacter = async (args) => {
   const updated = {
     ...summary,
     ...action === "reply" ? { pendingReply: true, replyTaskPendingAt: now } : {},
-    ...action === "auto" ? { lastAutoAt: now, autoDateKey: wall.dateKey, autoCount: autoCountForDay(summary, wall.dateKey) + 1 } : {},
+    ...action === "auto" && segmentInfo ? {
+      lastAutoAt: now,
+      autoDateKey: wall.dateKey,
+      autoCount: autoCountForDay(summary, wall.dateKey) + 1,
+      // 三段式记账：段内计数（段一变自然归零，见 autoCountForSegment）。
+      autoSegmentKey: segmentInfo.key,
+      autoSegmentCount: autoCountForSegment(summary, segmentInfo.key) + 1,
+      // 朋友圈水位线：刚提过的那批帖子不再提第二次（feedPosts 已按时间倒序）。
+      ...feedPosts.length > 0 ? { feedSeenAt: feedPosts[0].at } : {}
+    } : {},
     updatedAt: now
   };
   await db.prepare(
