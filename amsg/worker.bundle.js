@@ -7091,7 +7091,7 @@ function stripReasoningTags2(content) {
 }
 
 // utils/amsgBundleVersion.ts
-var AMSG_BUNDLE_VERSION = "2026-09-13.1";
+var AMSG_BUNDLE_VERSION = "2026-09-13.2";
 
 // utils/amsgTaskKinds.ts
 var AMSG_TASK_KIND_KEY = "amsgKind";
@@ -9046,6 +9046,7 @@ var rollFeedPostsSeen = (args) => {
   const seenAt = args.summary.feedSeenAt ?? 0;
   const fresh = posts.filter((p) => p.at > seenAt).sort((a, b) => b.at - a.at);
   if (fresh.length === 0) return [];
+  if (fresh.some((p) => p.mention)) return fresh;
   return seededUnitRandom(args.summary.charId, args.seedKey, "feed-see") < 0.6 ? fresh : [];
 };
 var buildFeedPostsBlock = (posts) => {
@@ -9053,6 +9054,13 @@ var buildFeedPostsBlock = (posts) => {
     const body = p.text ? p.text : "\uFF08\u53EA\u53D1\u4E86\u4E00\u5F20\u56FE\uFF0C\u6CA1\u5199\u5B57\uFF09";
     return `- ${body}${p.text && p.withImage ? "\uFF08\u8FD8\u914D\u4E86\u56FE\uFF09" : ""}`;
   });
+  if (posts.some((p) => p.mention)) {
+    return [
+      "\u3010\u5BF9\u65B9\u4E13\u95E8 @ \u4E86\u4F60\u3011\u4F60\u521A\u70B9\u5F00\u670B\u53CB\u5708\uFF0C\u770B\u5230\u5BF9\u65B9\u53D1\u7684\u65B0\u52A8\u6001\uFF0C\u53D1\u7684\u65F6\u5019\u8FD8\u7279\u610F\u63D0\u9192\u4F60\u6765\u770B\uFF1A",
+      ...lines,
+      "\u8FD9\u6761\u662F\u5BF9\u65B9\u70B9\u540D\u53EB\u4F60\u770B\u7684\uFF0C\u522B\u5F53\u6210\u968F\u624B\u5237\u5237\u5230\uFF1A\u53EF\u4EE5\u63A5\u4E00\u53E5\u3001\u56DE\u5E94\u4E00\u4E0B\u5185\u5BB9\uFF0C\u6216\u8005\u76F4\u63A5\u95EE\u300C\u53EB\u6211\u770B\u8FD9\u4E2A\u5E72\u561B\u300D\uFF1B\u4F46\u4E0D\u8981\u6C47\u62A5\u300C\u6211\u770B\u5230\u4F60\u53D1\u670B\u53CB\u5708\u4E86\u300D\uFF0C\u4E5F\u522B\u50CF\u70B9\u8D5E\u673A\u5668\u4EBA\u4E00\u6837\u5938\u3002"
+    ].join("\n");
+  }
   return [
     "\u3010\u4F60\u521A\u5237\u5230\u7684\u670B\u53CB\u5708\u3011\u4F60\u521A\u987A\u624B\u70B9\u5F00\u770B\u4E86\u773C\u670B\u53CB\u5708\uFF0C\u770B\u5230\u5BF9\u65B9\u53D1\u7684\u65B0\u52A8\u6001\uFF1A",
     ...lines,
